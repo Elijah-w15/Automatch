@@ -1,0 +1,81 @@
+# ====== YOUR JOB SEARCH: fill this in once, then run ======
+# The ONLY file you need to edit. (System internals live in config.yaml.)
+
+search_terms:                # job titles you're hunting for
+  - "job title 1"
+  - "job title 2"
+
+location: "New York, NY"     # <-- YOUR city here
+radius_miles: 25
+max_listing_age_hours: 24    # ignore postings older than this
+max_jobs: 250                # stop each run after this many NEW jobs
+                             # (boards often run out sooner; that's fine;
+                             # use a smaller number if runs take too long)
+
+# Experience level. Three options:
+#   "default"  rewards entry/mid jobs, sinks executive ones
+#   "entry"    show ONLY entry-level jobs
+#   "senior"   show ONLY senior jobs
+level: default
+
+# Yearly pay floor: drops jobs that LIST pay below this; postings with no
+# listed pay are kept. 60000, "60,000" and $60k all work. Blank = no filter.
+salary_min: 60000
+
+# Walk away from job types OR specific companies: a job is dropped if any
+# of these words appear in its TITLE, COMPANY NAME, or COMPANY INDUSTRY.
+#   construction  catches "Construction Project Manager" AND a construction
+#                 firm's "Project Engineer"
+#   amazon        drops every Amazon posting
+# Blank [] = exclude nothing.
+exclude: []
+
+# Minimum weighted-average score a job needs to appear in matches.html.
+# 0 = show everything, ranked. Change it and the next run re-ranks
+# instantly (no AI calls).
+threshold: 0
+
+# WILD CARD: one extra pick per run (the W slot): the job best
+# matching this description, even if it scored below your top matches.
+# Blank = off. Example: a job with a high match to my skills but asking
+# for more experience than I have
+wildcard:
+
+# ====== YOUR SCORING METRICS ======
+# Each block becomes a 0-1 metric the local LLM judges every job on, scored
+# against YOUR anchor examples below. weight = how much it counts in the
+# final score (1 = normal, 0.5 = half, 2 = double). Rewrite these around
+# what YOU care about in a job; add as many as you want in this format.
+vectors:
+  stability:   # name it whatever you score against; no spaces, use _ instead
+    weight: 1.0 # how much this metric matters (all 1.0 = even weight)
+    question: "How stable is the paycheck from this job?" # what the model scores on
+    anchors:    # what each level looks like, for the model to base scores on
+      0.0: "start your own business"
+      0.2: "work on commission"
+      0.4: "work hourly for a contractor"
+      0.6: "stable hourly job"
+      0.8: "full time salary job at a stable established company"
+      1.0: "government salary job, near guaranteed"
+
+  autonomy:
+    weight: 1.0
+    question: "How much would the candidate own problems end to end in this role?"
+    anchors:
+      0.0: "follow a script all day, every decision made for someone else"
+      0.2: "mostly executing other people's plans"
+      0.4: "some input on how the work gets done"
+      0.6: "owns their tasks and designs their own solutions"
+      0.8: "owns whole problems with minimal oversight"
+      1.0: "identifies the problem, designs, builds, and verifies the fix themselves"
+
+  learning_growth:
+    weight: 0.5
+    question: "How much would the candidate learn new skills and technologies in this role?"
+    anchors:
+      0.0: "same repetitive task forever, nothing new ever"
+      0.2: "rare exposure to anything outside the routine"
+      0.4: "occasional new tools, mostly familiar work"
+      0.6: "regularly touches new technologies and methods"
+      0.8: "constant learning, new problems most weeks"
+      1.0: "frontier work where learning IS the job"
