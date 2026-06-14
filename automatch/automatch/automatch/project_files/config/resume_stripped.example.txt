@@ -1,0 +1,19 @@
+Automotive technician moving into fleet diagnostics and shop management, with side projects in engine building, custom fabrication, and OBD data logging. Professional background in high-volume dealership service and preventive maintenance. ASE certified.
+
+Automotive Technician
+Diagnosed and repaired an average of 40+ vehicles per month across brake, suspension, electrical, and drivetrain systems; maintained a 98% first-visit fix rate and cut average diagnostic time by a third by building a shop-wide fault-code reference sheet adopted by all six bays.
+Performed warranty teardown documentation on engine and transmission failures, photographing and writing up root cause findings that recovered $80K/year in manufacturer warranty claims for the shop.
+
+LS Swap Build
+Completed a full LS V8 swap into a 1987 Chevy C10, fabricating custom motor mounts and transmission crossmember, rewiring the engine harness from scratch, and tuning fuel and spark tables on a standalone ECU until the truck passed Pennsylvania emissions on the first attempt.
+
+OBD Data Logger
+Built a Bluetooth OBD-II data logger that records live engine parameters to a phone during test drives, used to catch an intermittent misfire that three other shops had failed to reproduce. Hardware is an ELM327 module with a custom mount; logs are graphed to spot anomalies against known-good baselines.
+
+Mobile Tool Cart Redesign
+Redesigned the shop's mobile tool carts with custom-welded steel frames, foam-cut tool organization, and integrated power strips for battery chargers, cutting tool retrieval time during jobs and reducing lost-tool spend; the layout was copied for every cart in the shop.
+
+Fleet Maintenance Tracker
+A maintenance tracking system for a landscaping company's 12-truck fleet: service intervals, fault history, and cost per vehicle logged per VIN, with automatic reminders before oil, brake, and DOT-inspection deadlines. Cut surprise breakdowns to near zero in its first season and the owner now plans replacements using the cost-per-mile reports.
+
+Engine Diagnostics, MIG Welding, Brake Systems, OBD-II Scan Tools, Hydraulic Lifts, Preventive Maintenance, Engine Rebuilds, Electrical Troubleshooting, and Shop Management Software.

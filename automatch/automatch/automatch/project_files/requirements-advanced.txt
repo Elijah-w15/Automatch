@@ -1,0 +1,2 @@
+# ADVANCED install only (Discord ATS-resume bot) — basic users never get this
+discord.py
