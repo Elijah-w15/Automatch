@@ -1,0 +1,4 @@
+python-jobspy
+pandas          # used directly in scrape.py — don't rely on it transitively
+pyyaml
+requests
