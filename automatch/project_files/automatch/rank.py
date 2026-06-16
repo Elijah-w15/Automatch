@@ -8,7 +8,7 @@ from datetime import datetime
 
 from . import paths
 from .paths import read_jsonl
-from .scrape import dedupe_key, too_old, word_match
+from .scrape import dedupe_key, desc_fingerprint, too_old, word_match
 from .score import current_rub
 
 # pay periods -> multiplier to a yearly figure (40h weeks for hourly)
@@ -36,13 +36,16 @@ def _salary_bounds(job: dict) -> tuple[float, float] | None:
 
 
 def _job_index() -> dict:
-    """url -> (yearly pay bounds or None, 'title company industry' text) from
-    the raw scrape; rank-time filters always see fresh raw-posting data."""
+    """url -> (yearly pay bounds or None, 'title company industry' text,
+    full-description fingerprint or None) from the raw scrape; rank-time
+    filters and dedupe always see fresh raw-posting data."""
     idx = {}
     for j in read_jsonl(paths.JOBS):
         text = " ".join(str(j.get(k) or "") for k in
-                        ("title", "company", "company_industry")).lower()
-        idx[j.get("job_url") or ""] = (_salary_bounds(j), text)
+                        ("title", "company", "company_industry",
+                         "description")).lower()
+        idx[j.get("job_url") or ""] = (_salary_bounds(j), text,
+                                       desc_fingerprint(j.get("description")))
     return idx
 
 
@@ -112,7 +115,7 @@ def run(cfg: dict, vectors: dict) -> int:
     excl = [str(x).lower() for x in cfg.get("scrape", {}).get("exclude") or []]
     if excl:
         kept = [r for r in rows if not any(
-            word_match(x, idx.get(r["url"], (None, ""))[1]
+            word_match(x, idx.get(r["url"], (None, "", None))[1]
                        or f"{r.get('title', '')} {r.get('company', '')}")
             for x in excl)]
         if len(kept) < len(rows):
@@ -123,7 +126,7 @@ def run(cfg: dict, vectors: dict) -> int:
     smin = scfg.get("salary_min")
     if smin is not None:
         kept = [r for r in rows
-                if (b := idx.get(r["url"], (None, ""))[0]) is None
+                if (b := idx.get(r["url"], (None, "", None))[0]) is None
                 or b[1] >= float(smin)]
         if len(kept) < len(rows):
             print(f"  salary filter: dropped {len(rows) - len(kept)} "
@@ -137,16 +140,23 @@ def run(cfg: dict, vectors: dict) -> int:
     # collapse cross-board duplicates: the same posting listed on several
     # boards has different URLs; match on title + company first word and
     # keep the best-scoring copy so top_n slots aren't wasted
-    seen_keys, deduped = set(), []
+    seen_keys, seen_fps, deduped = set(), set(), []
     for r in rows:
         key = dedupe_key(r)
-        if key in seen_keys:
+        # the same posting re-listed under a different title shares no title
+        # key but has an identical body; collapse on the full-description
+        # fingerprint too (None for bodyless jobs, which never collapse)
+        fp = idx.get(r["url"], (None, "", None))[2]
+        if key in seen_keys or (fp is not None and fp in seen_fps):
             continue
         seen_keys.add(key)
+        if fp is not None:
+            seen_fps.add(fp)
         deduped.append(r)
     if len(deduped) < len(rows):
-        print(f"  dedupe: collapsed {len(rows) - len(deduped)} cross-board "
-              "duplicate postings", flush=True)
+        print(f"  dedupe: collapsed {len(rows) - len(deduped)} duplicate "
+              "postings (cross-board, or same body under a different title)",
+              flush=True)
     rows = deduped
     topn = int(scfg.get("top_n", 25))
     top = rows[:topn]
@@ -176,7 +186,7 @@ def run(cfg: dict, vectors: dict) -> int:
             f"{html.escape(r['title'])}</a></td>"
             f"<td>{html.escape(r['company'])}</td><td>{html.escape(r['location'])}</td>"
             f"<td>{html.escape(r.get('level', '-'))}</td>"
-            f"<td>{_fmt_pay(idx.get(r['url'], (None, ''))[0])}</td>"
+            f"<td>{_fmt_pay(idx.get(r['url'], (None, '', None))[0])}</td>"
             f"<td>{r['cosine']}</td>{vec_tds}</tr>")
     paths.MATCHES_HTML.write_text(f"""<!doctype html><meta charset="utf-8">
 <title>automatch: {now:%Y-%m-%d}</title><style>

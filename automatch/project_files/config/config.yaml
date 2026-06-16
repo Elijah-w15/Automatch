@@ -1,75 +1,52 @@
-# ====================================================================
-#  automatch system config: models, weights, and scraper plumbing.
-#  Your actual job search lives in profile.yaml -- the search fields
-#  here are only fallbacks, so most people never touch this file.
-# ====================================================================
+# automatch: system internals (models, weights, scraper plumbing).
+# Job targeting lives in profile.yaml, which overrides the matching
+# fields below.
 
-
-# ---- scraper -------------------------------------------------------
-# search_terms / location / radius_miles / hours_old / max_jobs are
-# FALLBACKS only: set them in profile.yaml, which overrides these.
 scrape:
-  sites:        [indeed, linkedin]
-  search_terms: ["Financial Analyst"]    # fallback -> profile.yaml wins
-  location:     "New York, NY"           # fallback -> profile.yaml wins
-  radius_miles: 20                       # fallback -> profile.yaml wins
-  hours_old:    72                       # fallback -> profile.yaml wins
-  max_jobs:     250                      # fallback -> profile.yaml wins
+  sites: [indeed, linkedin]
+  search_terms:                # fallback defaults; profile.yaml overrides
+    - "Financial Analyst"
+  location: "New York, NY"
+  radius_miles: 20
+  hours_old: 72                # widen for testing, tighten for daily use
+  max_jobs: 250                # new-jobs-per-run cap (CLI -r overrides per-term)
+  linkedin_fetch_description: true
+  request_delay_seconds: 3
+  country_indeed: "USA"
 
-  linkedin_fetch_description: true       # full text: slower, better match
-  request_delay_seconds:      3          # pause between requests
-  country_indeed:             "USA"      # Indeed region
-
-
-# ---- scoring -------------------------------------------------------
 score:
-  cosine_weight: 1.0     # resume<->job text-match weight (see note)
-  threshold:     0.0     # hide jobs below this score (0 = keep all)
-  top_n:         25      # number of rows in matches.html
-
-  # cosine note: the resume<->description match runs ~0.55-0.80 in
-  # practice, narrower than your 0-1 metrics -- raise cosine_weight to
-  # let resume match steer the ranking harder.
-
-  # ---- experience level: chosen by  level:  in profile.yaml --------
-  #   default   nudge scores by level (modifiers below); drop nothing
-  #   entry     keep ONLY entry-level jobs   (profile.yaml: level: entry)
-  #   senior    keep ONLY senior jobs        (profile.yaml: level: senior)
+  cosine_weight: 1.0           # how much the resume<->description embedding match
+                               # counts. note: cosine spans ~0.55-0.80 in practice
+                               # (narrower than your 0-1 vectors), so raise this if
+                               # you want resume-match to steer the ranking harder
+  threshold: 0.0               # drop matches scoring below this (0 = keep all)
+  top_n: 25                    # how many rows in matches.html
+  # Experience-level preference (judge classifies every job as
+  # entry / mid / senior / executive). Applied at RANK time; change these
+  # and re-run `rank-only` for instant re-ranking, no model calls.
   #
-  # DEFAULT-mode modifiers, tune freely: added to each job's score by
-  # its level (+ rewards, - buries). Applied at rank time, so edits
-  # re-rank instantly with no AI calls.
-  level_adjust:
-    entry:      0.1      # + favor entry roles
-    mid:        0.1      # + favor mid roles
-    senior:     0.0      #   neutral
-    executive: -0.3      # - bury roles above your level
-
-  # entry / senior modes set this filter automatically from profile.yaml.
-  # Uncomment to force specific levels by hand instead:
+  # HARD mode: uncomment level_filter to keep ONLY these levels and drop
+  # everything else entirely:
   # level_filter: [entry, mid]
+  #
+  # SOFT mode (default when level_filter is unset): reward reachable levels,
+  # punish out-of-reach ones; nothing is excluded, just re-ranked:
+  level_adjust:
+    entry: 0.1
+    mid: 0.1
+    senior: 0.0
+    executive: -0.3
 
-
-# ---- AI models (served by ollama) ----------------------------------
-models:
-  host:  "http://localhost:11434"   # OLLAMA_HOST env var overrides this
-  embed: "nomic-embed-text"         # embeddings for resume<->job match
-  judge: "mistral-nemo"             # scores each job against your rubric
-
-
-# ---- file locations (optional overrides) ---------------------------
-# Defaults sit next to the program: ./output for results, and your
-# resume + stripped match-resume in ./config. Override any of them here.
-# Precedence for each:  env var  >  this paths: block  >  default
-#   output_dir    ->  AUTOMATCH_OUTPUT        (results: matches.html, ...)
-#   resume        ->  AUTOMATCH_RESUME        (config/resume.txt)
-#   resume_embed  ->  AUTOMATCH_RESUME_EMBED  (config/resume_embed.txt, the
-#                                              OPTIONAL stripped match-resume)
-# (The config dir itself can't be set here -- we'd have to read this file
-# to find it; use AUTOMATCH_CONFIG for that.) Inside Docker ./output and
-# ./config are mounted volumes, so custom paths mainly apply when running
-# outside the container. Use absolute paths.
-# paths:
-#   output_dir:   /absolute/path/to/output
-#   resume:       /absolute/path/to/resume.txt
-#   resume_embed: /absolute/path/to/resume_embed.txt
+models:                        # served by ollama; OLLAMA_HOST env var overrides host
+  host: "http://localhost:11434"
+  embed: "nomic-embed-text"
+  # judge options (tier, approx VRAM):
+  #   llama3.1:8b  = light    (CPU-only or ~6GB VRAM)
+  #   mistral-nemo = balanced (~8GB VRAM)
+  #   qwen2.5:14b  = sharp    (~12GB VRAM)
+  #   qwen2.5:32b  = max      (24GB+ VRAM)
+  # Switching via `python3 edit.py` (scoring settings) or the bot `!model 1-4`
+  # downloads the chosen model first. Hand-editing this line does NOT download:
+  # if the model is not pulled, scoring fails per job with an
+  # `ollama pull <model>` hint, so run `ollama pull <model>` first.
+  judge: "mistral-nemo"

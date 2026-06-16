@@ -1,34 +1,39 @@
+# Compose config defining the automatch services, volumes, and run-time options.
+name: automatch        # pin the project name so images/containers are
+                       # "automatch-*" regardless of the folder it runs from
 services:
   automatch:
     build:
-      context: .
+      context: .                   # build the image from ./Dockerfile
       target: base                 # basic stage: no discord, stays lean
-    # Write output as the host user, not root, so non-Docker runs and a plain
-    # `rm` on the results still work ($UID falls back to 1000, the default
-    # first user on a single-user Linux box).
+    # run as the host user so output files are owned by that user, not root.
+    # UID/GID default to 1000 (the typical first Linux user) when unset.
     user: "${UID:-1000}:${GID:-1000}"
     environment:
-      HOME: /tmp                   # some libs need a writable $HOME
+      HOME: /tmp                   # some libs want a writable $HOME
     volumes:
-      # config and results live on the host; the container stays disposable.
+      # mount host config and output dirs into the container so data persists
+      # on disk while the container stays disposable.
       - ./config:/app/config
       - ./output:/app/output
     extra_hosts:
-      # Map host.docker.internal to the host gateway so the container can reach
-      # ollama on the host (Linux doesn't provide this name by default).
+      # map host.docker.internal to the host gateway so the container can reach
+      # ollama running on the host (not provided by default on Linux).
       - "host.docker.internal:host-gateway"
+    # load secrets at run time as environment variables from .env (gitignored
+    # and dockerignored) instead of baking them into the image. .env.example is
+    # the committed template showing the expected shape.
     env_file:
-      # Secrets enter at runtime, never baked into the image. Optional so a
-      # fresh clone runs without one; .env.example is the committed template.
       - path: .env
-        required: false
+        required: false        # fresh clones run without one; cp .env.example .env to use it
 
-  # Optional ATS Discord bot, behind a compose profile so basic users never
-  # build or see it:  docker compose --profile advanced run --rm bot
+  # Optional Discord bot, gated behind the "advanced" profile so it is not
+  # built or run by default. Start it with:
+  #   docker compose --profile advanced run --rm bot
   bot:
     build:
       context: .
-      target: advanced             # base + discord.py
+      target: advanced           # base + discord.py
     profiles: ["advanced"]
     user: "${UID:-1000}:${GID:-1000}"
     environment:
@@ -40,5 +45,5 @@ services:
       - "host.docker.internal:host-gateway"
     env_file:
       - path: .env
-        required: false            # holds DISCORD_BOT_TOKEN etc.; written by setup.py
+        required: false        # holds DISCORD_BOT_TOKEN etc.; written by setup.py
     command: ["bot"]

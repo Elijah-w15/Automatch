@@ -16,6 +16,7 @@ import os
 import re
 import shutil
 import subprocess
+import threading
 import time
 import urllib.request
 from pathlib import Path
@@ -36,15 +37,35 @@ HERE = Path(__file__).resolve().parent
 PROFILE = HERE / "config" / "profile.yaml"
 RESUME = HERE / "config" / "resume.txt"
 RESUME_TEMPLATE = HERE / "config" / "resume_template.txt"
-RESUME_EMBED = HERE / "config" / "resume_embed.txt"   # OPTIONAL: stripped, embed-only
 CONFIG = HERE / "config" / "config.yaml"
 ENV = HERE / ".env"
 OLLAMA = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
 ANCHOR_STEPS = ("0.0", "0.2", "0.4", "0.6", "0.8", "1.0")
 MARKER = "<tag>"
-# example resume path in the OS's own style (Windows users shouldn't see /home)
-RESUME_EG = (r"C:\Users\You\Documents\resume.docx" if os.name == "nt"
-             else "/home/you/Documents/resume.txt")
+DONATE = ""        # e.g. "https://ko-fi.com/yourname"; shown after setup
+
+# the local judge models the user picks from, lightest -> heaviest. heavier
+# judges score more sharply but need more GPU/RAM; only the chosen one is
+# ever downloaded. (name, tier, who-it's-for, approx download size)
+JUDGE_TIERS = [
+    ("llama3.1:8b",  "light",    "CPU-only / no GPU, or ~6GB VRAM",      "~4.9GB"),
+    ("mistral-nemo", "balanced", "~8GB VRAM GPU (most gaming cards)",    "~7GB"),
+    ("qwen2.5:14b",  "sharp",    "~12GB VRAM GPU (RTX 4070+)",           "~9GB"),
+    ("qwen2.5:32b",  "max",      "24GB+ VRAM GPU (RTX 4090/3090, etc.)", "~20GB"),
+]
+
+# a ready-made metric offered during setup so users aren't forced to invent
+# one cold. Anchors key on the qualification/seniority GAP so the judge can
+# actually spread scores (a vague ladder makes it park everything mid-range).
+BUILTIN_INTERVIEW_ODDS = (
+    "interview_odds",
+    "How likely am I to land an interview given my experience level?",
+    {"0.0": "my background barely matches this kind of role; I am not really qualified for it",
+     "0.2": "only a little of what they want overlaps my skills, and they also want more experience or seniority than I have",
+     "0.4": "I match some of the skills but there is a clear experience or seniority gap; a longer-shot stretch",
+     "0.6": "they want more experience than I have, but I match most of the skills they list; a stretch worth applying to",
+     "0.8": "I match most of the skills and my experience is about what they ask for",
+     "1.0": "I match the skills and clearly meet or exceed the experience they ask for"})
 
 
 def ask(prompt: str, default: str = "", example: str = "",
@@ -91,10 +112,7 @@ def ask_secret(prompt: str) -> str:
         import tty
     except ImportError:
         import getpass
-        secret = getpass.getpass(prompt).strip()
-        if secret:                       # getpass shows nothing as you type, so
-            print(f"      (got {len(secret)} characters)")   # confirm it landed
-        return secret
+        return getpass.getpass(prompt).strip()
     sys.stdout.write(prompt)
     sys.stdout.flush()
     fd = sys.stdin.fileno()
@@ -121,28 +139,24 @@ def ask_secret(prompt: str) -> str:
                 if chars:
                     chars.pop()
                     redraw()
-            elif c == "\x1b":                # escape seq: arrow keys, and the
-                seq = sys.stdin.read(1)      # \e[200~ / \e[201~ wrappers that
-                if seq in ("[", "O"):        # terminals put around a PASTE --
-                    while True:              # consume the whole sequence so the
-                        b = sys.stdin.read(1)        # "200~"/"201~" digits never
-                        if not b or "@" <= b <= "~":  # land in the token and
-                            break                     # corrupt it
             elif c >= " ":
                 chars.append(c)
                 redraw()
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, old)
     print()
-    result = "".join(chars).strip()
-    if result:
-        print(f"      (got {len(result)} characters)")
-    return result
+    return "".join(chars).strip()
+
+
+_yn_taught = False    # first y/n prompt teaches "--> enter"; the rest show "(y/n)"
 
 
 def ask_yn(prompt: str, default: str = "y") -> bool:
+    global _yn_taught
+    hint = "y/n --> enter" if not _yn_taught else "y/n"
+    _yn_taught = True
     while True:
-        v = (input(f"  {prompt} (y/n --> enter)\n    user input: ")
+        v = (input(f"  {prompt} ({hint})\n    user input: ")
              .strip() or default).lower()
         if v in ("y", "yes", "n", "no"):
             print()
@@ -153,13 +167,16 @@ def ask_yn(prompt: str, default: str = "y") -> bool:
 def ask_int(prompt: str, default: int, note: str = "", example: str = "") -> int:
     while True:
         v = ask(prompt, str(default), example=example, note=note)
-        try:
-            return int(v.replace(",", ""))
-        except ValueError:
-            print("  plain number please (example: 25)")
+        m = re.search(r"-?\d[\d,]*", v)      # pull the number out of "25 miles"
+        if m:
+            try:
+                return int(m.group().replace(",", ""))
+            except ValueError:
+                pass
+        print("  enter just a number (example: 25)")
 
 
-PLAIN_OK = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 ,.&/()'+_-]*$")
+PLAIN_OK = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 ,.;&/()'+_-]*$")  # ; is safe unquoted
 
 
 def yv(s: str) -> str:
@@ -183,25 +200,11 @@ def _listify(raw: str) -> list:
     return out
 
 
-# Section banners are numbered as they're SHOWN, not by a fixed list: when the
-# bootstrap flow skips [2] dependencies, the counter just doesn't tick for it,
-# so the user sees [1] -> [2] -> ... with no gap. Standalone setup.py still
-# shows dependencies, and there it's [2] like before.
-_step_no = 0
-
-
-def head(title: str, gap: bool = False) -> None:
-    global _step_no
-    _step_no += 1
-    banner = f"==== [{_step_no}] {title} "
-    print(("\n" if gap else "") + banner + "=" * max(0, 64 - len(banner)))
-
-
 # ---------------------------------------------------------------- search ----
 def step_search() -> dict:
-    head("your job search")
+    print("==== [3] your job search " + "=" * 39)
     print()
-    print("  type back at any question to redo the previous one")
+    print('  Type "back" at any question to redo the previous one.')
     print()
 
     def q_terms():
@@ -240,8 +243,10 @@ def step_search() -> dict:
     fields = [
         ("terms", q_terms),
         ("loc", lambda: ask("the city, state to search around", "Philadelphia, PA")),
-        ("radius", lambda: ask_int("search radius in miles", 25)),
-        ("age", lambda: ask_int("ignore postings older than (hours)", 24)),
+        ("radius", lambda: ask_int(
+            "search radius in miles (just the number)", 25)),
+        ("age", lambda: ask_int(
+            "ignore postings older than how many hours? (just the number)", 24)),
         ("cap", lambda: ask_int(
             "stop each run after scraping how many new jobs", 128,
             example="128 or until no more jobs listed",
@@ -249,8 +254,10 @@ def step_search() -> dict:
         ("level", q_level),
         ("salary", q_salary),
         ("excludes", lambda: _listify(ask(
-            "words to EXCLUDE\n  job types or companies, blank = none",
-            example="construction, amazon",
+            "words to BLOCK: if any shows up in a job's posting, that job is\n"
+            "  dropped from your list (companies, job types, tasks, anything).\n"
+            "  blank = none",
+            example="amazon, construction, contract",
             space=False))),    # section ends: blank, not divider
     ]
     s, i = {}, 0
@@ -270,6 +277,7 @@ def step_search() -> dict:
 # --------------------------------------------------------------- metrics ----
 def collect_metric(n: int, taken: set) -> tuple[str, str, dict]:
     print(f"\n  ---- metric #{n} " + "-" * 47)
+    print()
 
     def q_name():
         while True:
@@ -294,7 +302,8 @@ def collect_metric(n: int, taken: set) -> tuple[str, str, dict]:
             else:
                 print(f"  the question the AI answers about every job to "
                       f"score '{name}'")
-                print("  (example: How likely am I to get an interview?)")
+                print("  (example: How likely am I to land an interview "
+                      "given my experience level?)")
                 question = ask("")
                 if not question:
                     print("  give a short question")
@@ -306,78 +315,86 @@ def collect_metric(n: int, taken: set) -> tuple[str, str, dict]:
             else:
                 print("  (this is the first question of the metric)")
 
-    print(f"  describe what each score looks like for '{name}': short")
-    print("  concrete phrases; the examples shown are for an interview-odds "
-          "metric.")
+    print(f"  describe what each score looks like for '{name}'. for best "
+          "results use short,")
+    print("  concrete phrases.")
     print()
+    print("  levels:")
+    # the list builds line by line as the user types each one (the example
+    # rubric is shown up in the rubric intro, so no per-score hints here)
     anchors = {}
-    anchor_ex = {"0.0": "completely underqualified, zero overlapping skills",
-                 "0.2": "some overlapping skills but they want a PhD I don't have",
-                 "0.4": "a stretch, but a few overlapping skills",
-                 "0.6": "decent chance, several overlapping skills",
-                 "0.8": "good fit, experience and skillset wise",
-                 "1.0": "this job was made for you"}
-
-    def vlines(s: str) -> int:
-        """How many terminal lines a printed string actually occupies;
-        long answers wrap, and the collapse must erase every wrapped line."""
-        cols = shutil.get_terminal_size().columns
-        return max(1, -(-len(s) // cols))
-
     i = 0
     while i < len(ANCHOR_STEPS):
         step = ANCHOR_STEPS[i]
-        q_render = f"    {step} looks like (example: {anchor_ex[step]})"
         try:
             while True:
-                d = ask(f"  {step} looks like", example=anchor_ex[step],
-                        space=False)
+                d = input(f"    {step}: ").strip()
+                if d.lower() == "back":
+                    raise GoBack
                 if d:
                     break
-                print("    give a short example phrase")
+                print("    (enter a short phrase)")
         except GoBack:
             if i == 0:
-                print("    (this is the first anchor)")
+                print("    (this is the first score; nothing to undo)")
                 continue
             i -= 1
-            if sys.stdout.isatty():        # un-collapse the previous anchor
-                prev = f"    {ANCHOR_STEPS[i]}: {anchors[ANCHOR_STEPS[i]]}"
-                up = (vlines(q_render) + vlines("    user input: back")
-                      + 1 + vlines(prev))
-                sys.stdout.write(f"\033[{up}A\033[0J")
-                if i > 0:
-                    print()
+            anchors.pop(ANCHOR_STEPS[i], None)
             continue
         anchors[step] = d
-        if sys.stdout.isatty():            # collapse Q+A into one tidy line,
-            up = (vlines(q_render) + vlines("    user input: " + d)
-                  + (0 if i == 0 else 1))  # + the blank above, after the 1st
-            sys.stdout.write(f"\033[{up}A\033[0J")
-            print(f"    {step}: {d}")
-            print()
         i += 1
     print()
     return name, question, anchors
 
 
-def step_metrics() -> tuple:
-    head("your scoring rubric", gap=True)
-    print()
-    print("  What should a job be EVALUATED on? Each metric becomes a 0-1")
-    print("  score judged by the local AI against your own example ladder:")
-    print()
-    print("    0.0  what a terrible fit looks like, in your words")
-    print("    0.2  ...")
-    print("    1.0  what a perfect fit looks like")
-    print()
-    print("  the bot averages the scores across your metrics (weighted) and")
-    print("  only jobs above your threshold make the list")
+def collect_metrics() -> list:
+    """Offer the ready-made interview_odds metric, then loop 'add your own'.
+    Returns a list of (name, question, anchors) tuples. Shared by the setup
+    rubric step and the standalone metric editor's 'replace all' action."""
     metrics = []
+    # offer the ready-made interview_odds metric so nobody has to invent one
+    # from a blank page
+    print("\n  default example metric: 'interview_odds'")
+    print()
+    print(f"  question to the AI: {BUILTIN_INTERVIEW_ODDS[1]}")
+    print()
+    print("  levels:")
+    for step, text in BUILTIN_INTERVIEW_ODDS[2].items():
+        print(f"    {step}: {text}")
+    if ask_yn("\n  add default 'interview_odds' as a metric?", "y"):
+        metrics.append(BUILTIN_INTERVIEW_ODDS)
+        print("  added.")
+        print()
+    added_own = 0
     while True:
+        if metrics:
+            if added_own == 0:    # first time: invite + remind they can DIY
+                q = ("\n  would you like to add any of your own custom "
+                     "metrics? (commute, adhd friendly, interesting ...)")
+            else:                 # already added one: offer one more, repeatable
+                q = "\n  add another metric?"
+            if not ask_yn(q, "n"):
+                break
         metrics.append(collect_metric(len(metrics) + 1,
                                       {m[0] for m in metrics}))
-        if not ask_yn("\n  add another metric?", "n"):
-            break
+        added_own += 1
+    return metrics
+
+
+def step_metrics() -> tuple:
+    print("\n==== [4] your scoring rubric " + "=" * 35)
+    print()
+    print("  Each job gets scored on the things you care about. A 'metric' is")
+    print("  one thing, scored 0.0 to 1.0, where you write a short example of")
+    print("  what each score looks like (your 0.0, your 0.6, your 1.0...).")
+    print()
+    print("  For best results, keep each metric to a single idea so the AI can")
+    print("  score it cleanly. e.g. make 'commute distance' one metric and")
+    print("  'free time' a separate one.")
+    print()
+    print("  the bot averages your metrics and only jobs above your")
+    print("  threshold make the list.")
+    metrics = collect_metrics()
     while True:
         th = ask_nb("minimum average score a job needs to make the list, "
                     "0 to 1\n  blank = show everything, ranked",
@@ -436,18 +453,29 @@ def _fix_one(model: str, text: str, rule: str, context: str) -> str:
     return fixed or text
 
 
-def spellfix(s: dict, metrics: list) -> tuple[dict, list]:
+def spellfix(s: dict, metrics: list, quiet: bool = False,
+             report: list | None = None) -> tuple[dict, list]:
     """Fix spelling per-string with the local model when ollama is already up
     ('deloite' -> 'Deloitte'; exclusions match by exact substring, so typos
-    there genuinely break filtering). No-op when ollama isn't installed yet."""
+    there genuinely break filtering). No-op when ollama isn't installed yet.
+
+    quiet=True suppresses prints (it runs in a background thread while the
+    user does later steps) and appends its result lines to `report` for the
+    caller to print after the thread is joined."""
     model = judge_model()
     changes = []
+
+    def say(msg: str) -> None:
+        if quiet:
+            if report is not None:
+                report.append(msg)
+        else:
+            print(msg)
 
     def fix(text, rule, context):
         if len(text.strip()) < 4:    # too short to spellcheck; the model
             return text              # invents content for fragments
-        print(".", end="", flush=True)   # a dot per field: shows it's alive,
-        try:                             # not frozen, during the slow AI calls
+        try:
             new = _fix_one(model, text, rule, context)
         except (OSError, ValueError):
             return text
@@ -458,11 +486,12 @@ def spellfix(s: dict, metrics: list) -> tuple[dict, list]:
 
     have = _ollama_models()    # reachable AND the judge model is pulled?
     if have is None or not _model_present(model, have):
-        print("\n  (spell-check skipped: ollama or the judge model isn't "
-              "installed yet)")
+        say("\n  (spell-check skipped: ollama or the judge model isn't "
+            "installed yet)")
         return s, metrics
-    print("\n  spell-checking your answers with the local AI "
-          "(first time can take a minute)...")
+    if not quiet:
+        print("\n  spell-checking your answers with the local AI "
+              "(first time can take a minute)...")
     s["loc"] = fix(s["loc"], "Reply in the form 'City, ST' with the 2-letter "
                              "state abbreviation (so 'philadelphia' becomes "
                              "'Philadelphia, PA').",
@@ -485,13 +514,12 @@ def spellfix(s: dict, metrics: list) -> tuple[dict, list]:
                        "about a job.")
              for step, text in a.items()}
         fixed_metrics.append((n, q, a))
-    print()                            # close the line of progress dots
     if changes:
-        print("  fixed:")
+        say("  spell-check fixed:")
         for c in changes:
-            print(f"    {c}")
+            say(f"    {c}")
     else:
-        print("  no spelling fixes needed")
+        say("  spell-check: no fixes needed")
     return s, fixed_metrics
 
 
@@ -537,35 +565,18 @@ def write_profile(s: dict, metrics: list) -> None:
                 "    anchors:"]
         out += [f"      {step}: {yv(text)}" for step, text in anchors.items()]
         out += [""]
-    PROFILE.write_text("\n".join(out), encoding="utf-8")
-    print(f"\n  wrote {PROFILE}")
+    PROFILE.write_text("\n".join(out))
+    print("\n  profile complete.")
 
 
 # ---------------------------------------------------------------- resume ----
 def step_resume(advanced: bool = False) -> None:
-    head("your resume", gap=True)
+    print("\n==== [5] your resume " + "=" * 43)
     print()
     if advanced:
         _resume_template_upload()
     else:
         _resume_upload()
-    if RESUME.exists():               # offer the optional stripped match-resume
-        _embed_resume_upload()
-
-
-def _read_text_any(p: Path) -> str:
-    """Read a user-supplied text file robustly. Resumes get saved as UTF-8
-    (Word/Google Docs export, modern editors) or legacy Windows-1252 ('ANSI'
-    in old Notepad). Reading with the platform default (cp1252 on Windows)
-    crashes on a normal UTF-8 file with smart quotes -- so decode explicitly,
-    UTF-8 first, then fall back. Returns text the Docker side reads as UTF-8."""
-    data = p.read_bytes()
-    for enc in ("utf-8-sig", "cp1252"):
-        try:
-            return data.decode(enc)
-        except UnicodeDecodeError:
-            continue
-    return data.decode("utf-8", "replace")
 
 
 def _read_resume(src: Path) -> str:
@@ -579,7 +590,7 @@ def _read_resume(src: Path) -> str:
         xml = (xml.replace("</w:p>", "\n").replace("<w:tab/>", "\t")
                   .replace("<w:br/>", "\n"))
         return html_.unescape(re.sub(r"<[^>]+>", "", xml))
-    return _read_text_any(src)
+    return src.read_text()
 
 
 def _strip_tag(text: str) -> str:
@@ -596,13 +607,13 @@ def _resume_template_upload() -> None:
     print(f"  in your resume, add a {MARKER} in the skills section")
     print(f"  the discord bot will replace {MARKER} with each job's keywords")
     print(f"  example:  skills: microsoft suite, {MARKER}, python, etc.")
-    print("  (a working example resume: config/resume_template.example.docx)")
+    print("  (a working example resume: docs/resume_template.example.docx)")
     print("  save it as .docx (Word/Google Docs) or .txt; both work")
     print()
     print("  once you add the tag, tell me where the file is:")
     while True:
         p = ask_nb("path to your tagged resume .txt\n  I'll copy it into place",
-                   example=RESUME_EG)
+                   example="/home/you/Documents/resume.txt")
         src = Path(p.strip("'\"")).expanduser() if p else RESUME_TEMPLATE
         if not src.exists():
             if not p and ask_yn("  config/resume_template.txt still missing\n  "
@@ -624,11 +635,11 @@ def _resume_template_upload() -> None:
             print(f"  no {MARKER} found in that file; add it to the skills "
                   "line like this:")
             print(f"      skills: microsoft suite, {MARKER}, python, etc.")
-            print("  (a working example: config/resume_template.example.docx)")
+            print("  (a working example: docs/resume_template.example.docx)")
             print("  save, then give me the path again")
             continue
-        RESUME_TEMPLATE.write_text(text, encoding="utf-8")
-        RESUME.write_text(_strip_tag(text), encoding="utf-8")
+        RESUME_TEMPLATE.write_text(text)
+        RESUME.write_text(_strip_tag(text))
         # keep the ORIGINAL docx too: per-job resumes can then be real
         # .docx files with the user's formatting intact. Only touched on a
         # NEW upload; keeping the existing template must not delete it.
@@ -653,7 +664,7 @@ def _resume_upload() -> None:
     print("  your resume can be .docx (Word/Google Docs) or plain .txt")
     while True:
         p = ask_nb("path to your resume .txt\n  I'll copy it into place",
-                   example=RESUME_EG)
+                   example="/home/you/Documents/resume.txt")
         if not p:
             if RESUME.exists():
                 print("  found it. good.")
@@ -670,7 +681,7 @@ def _resume_upload() -> None:
             print(f"  {src.suffix} won't work; use .txt or .docx")
             continue
         try:
-            RESUME.write_text(_read_resume(src), encoding="utf-8")
+            RESUME.write_text(_read_resume(src))
         except Exception:
             print("  couldn't read that file. is it a normal .docx or .txt?")
             continue
@@ -679,69 +690,106 @@ def _resume_upload() -> None:
         return
 
 
-def _embed_resume_upload() -> None:
-    """OPTIONAL (asked once, during first-startup setup): a stripped-down resume
-    used ONLY for the job-matching (embedding) step. Removing the name, contact
-    info, education and section titles ('Skills', 'Job History', ...) leaves
-    just the real substance, so the matcher references real experience instead
-    of boilerplate -- sharper results. The full config/resume.txt is still what
-    the AI judge and the resume builder read."""
-    if RESUME_EMBED.exists():
-        print()
-        print(f"  found a stripped match-resume (config/resume_embed.txt, "
-              f"{RESUME_EMBED.stat().st_size} bytes)")
-        if not ask_yn("  replace it?", "n"):
-            return
-    else:
-        print()
-        print("  OPTIONAL: a stripped resume for sharper job matching")
-        print("  automatch can match jobs against a stripped-down copy of your")
-        print("  resume -- just the real substance, with the filler removed:")
-        print("    - your name and contact info")
-        print("    - education")
-        print("    - section titles like 'Skills' or 'Job History'")
-        print("  this points the matching model at your real experience instead")
-        print("  of headings, for better results. (Your full resume is still")
-        print("  used for the AI judging and the resume builder.)")
-        print("  example to copy the format: config/resume_stripped.example.txt")
-        print()
-        if not ask_yn("  provide a stripped version now?", "n"):
-            print("  no problem -- matching will auto-strip your resume's name")
-            print("  and contact info for you instead.")
-            return
-    while True:
-        p = ask_nb("path to your stripped resume (.docx or .txt)\n"
-                   "  I'll copy it into place", example=RESUME_EG)
-        if not p:
-            print("  skipped; the matcher will auto-strip your resume instead.")
-            return
-        src = Path(p.strip("'\"")).expanduser()
-        if not src.exists():
-            print(f"  can't find {src}")
-            continue
-        if src.suffix.lower() not in (".txt", ".md", ".docx", ""):
-            print(f"  {src.suffix} won't work; use .txt or .docx")
-            continue
-        try:
-            RESUME_EMBED.write_text(_read_resume(src), encoding="utf-8")
-        except Exception:
-            print("  couldn't read that file. is it a normal .docx or .txt?")
-            continue
-        conv = " (converted from .docx)" if src.suffix.lower() == ".docx" else ""
-        print(f"  copied to config/resume_embed.txt{conv}. matching will use")
-        print("  this stripped copy; judging still uses your full resume.")
-        return
-
-
 # ------------------------------------------------------------------ deps ----
 def judge_model() -> str:
     try:
-        for line in CONFIG.read_text(encoding="utf-8").splitlines():
+        for line in CONFIG.read_text().splitlines():
             if line.strip().startswith("judge:"):
                 return line.split(":", 1)[1].split("#")[0].strip().strip("\"'")
     except OSError:
         pass
     return "mistral-nemo"
+
+
+def _set_judge(model: str) -> None:
+    """Persist the chosen judge model to config.yaml's `judge:` line so
+    judge_model() and the scorer pick it up. Leaves the rest untouched."""
+    try:
+        lines = CONFIG.read_text().splitlines()
+    except OSError:
+        return
+    for i, line in enumerate(lines):
+        if line.strip().startswith("judge:"):
+            indent = line[:len(line) - len(line.lstrip())]
+            lines[i] = f'{indent}judge: "{model}"'
+            CONFIG.write_text("\n".join(lines) + "\n")
+            return
+
+
+def _gpu_info() -> tuple[str, int] | None:
+    """(name, total VRAM in MB) for the largest NVIDIA GPU, or None when
+    there's no nvidia-smi (CPU-only, or a non-NVIDIA / Apple GPU we can't
+    size)."""
+    if not shutil.which("nvidia-smi"):
+        return None
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=name,memory.total",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=5)
+    except OSError:
+        return None
+    if out.returncode != 0:
+        return None
+    best = None
+    for line in out.stdout.strip().splitlines():
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) >= 2 and parts[-1].isdigit():
+            mb = int(parts[-1])
+            if best is None or mb > best[1]:
+                best = (",".join(parts[:-1]).strip(), mb)
+    return best
+
+
+def _recommended_tier() -> int:
+    """Index into JUDGE_TIERS suggested by detected VRAM. Undetectable
+    hardware falls back to 'balanced' (nemo): a safe middle the user can
+    override either way."""
+    info = _gpu_info()
+    if info is None:
+        return 1
+    vram = info[1]
+    if vram >= 22000:
+        return 3
+    if vram >= 11000:
+        return 2
+    if vram >= 6000:
+        return 1
+    return 0
+
+
+def step_model(have: list) -> None:
+    """Pick the local judge model (the AI that scores every job), sized to
+    the user's hardware. Writes the choice to config.yaml; the pull step
+    then downloads ONLY that model (plus the embedder), never all four."""
+    info = _gpu_info()
+    rec = _recommended_tier()
+    print("\n  ---- scoring model " + "-" * 45)
+    print("  the local AI that judges every job against your rubric. heavier")
+    print("  = sharper, more decisive scores, but needs more GPU/RAM and runs")
+    print("  slower per job. pick one; change it any time with !model 1-4 on")
+    print("  Discord, or by editing config.yaml.")
+    print()
+    if info:
+        print(f"  Detected: {info[0]}, {round(info[1] / 1024)}GB VRAM")
+    else:
+        print("  No GPU detected")
+    while True:
+        print()
+        for i, (model, tier, who, size) in enumerate(JUDGE_TIERS, 1):
+            owned = "  [already downloaded]" if _model_present(model, have) else ""
+            star = "  <- recommended for detected hardware" if i - 1 == rec else ""
+            print(f"   {i}) {model:<13} {tier:<9} {who} ({size}){owned}{star}")
+        print()
+        raw = input(f"  pick 1-{len(JUDGE_TIERS)} (enter = {rec + 1}): ").strip()
+        idx = (int(raw) - 1 if raw.isdigit()
+               and 1 <= int(raw) <= len(JUDGE_TIERS) else rec)
+        chosen = JUDGE_TIERS[idx][0]
+        if ask_yn(f"  confirm chosen model: {chosen}?", "y"):
+            break
+    _set_judge(chosen)
+    print(f"  {chosen} set. change it anytime with !model 1-4 on Discord, "
+          "or in config.yaml")
 
 
 OVERRIDE = Path("/etc/systemd/system/ollama.service.d/override.conf")
@@ -754,7 +802,8 @@ def offer(cmd: str, why: str, admin: bool = True) -> bool:
     priv = " with administrative privileges" if admin else ""
     print(f"  run this command{priv} to continue:")
     print(f"\n      {cmd}\n")
-    if ask_yn("  run it now?", "y"):
+    if ask_yn(f"  run {'the permission command' if admin else 'that command'} "
+              "now?", "y"):
         ok = subprocess.run(cmd, shell=True).returncode == 0
         print("  done." if ok else
               f"  that command failed; fix it, then rerun: {PY} setup.py")
@@ -777,8 +826,151 @@ def _ollama_models() -> list | None:
         return None
 
 
-def step_deps() -> bool:
-    head("dependencies")
+def _human(n: float) -> str:
+    """Bytes as a short human size, e.g. 1.9GB."""
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024 or unit == "TB":
+            return f"{n:.0f}{unit}" if unit == "B" else f"{n:.1f}{unit}"
+        n /= 1024
+    return f"{n:.1f}TB"
+
+
+def _draw_bar(label: str, done: int, total: int, width: int = 26) -> None:
+    """Redraw an in-place percent bar on the current line. With no byte
+    total (manifest / verify / write phases) it shows the phase, no number."""
+    if total > 0:
+        frac = max(0.0, min(1.0, done / total))
+        filled = int(frac * width)
+        bar = "#" * filled + "." * (width - filled)
+        line = (f"  {label:<20.20} [{bar}] {frac * 100:5.1f}%  "
+                f"{_human(done)}/{_human(total)}")
+    else:
+        line = f"  {label:<20.20} [{'.' * width}]    ...   "
+    # trailing pad clears leftovers when a line gets shorter
+    sys.stdout.write("\r" + line + "        ")
+    sys.stdout.flush()
+
+
+def _pull_model(model: str) -> bool:
+    """Download an ollama model through the streaming /api/pull endpoint,
+    drawing our OWN percent-done bar from the byte counts it streams. The
+    ollama CLI's spinner can hide the percentage in some terminals; this
+    always shows how far along (and how big) the download is. Sums every
+    layer so the bar reflects the whole model, not just the current layer."""
+    print(f"\n  downloading {model} ...")
+    req = urllib.request.Request(
+        f"{OLLAMA}/api/pull",
+        data=json.dumps({"model": model, "stream": True}).encode(),
+        headers={"Content-Type": "application/json"})
+    layers: dict[str, tuple[int, int]] = {}   # digest -> (completed, total)
+    try:
+        with urllib.request.urlopen(req, timeout=None) as r:
+            for raw in r:
+                raw = raw.strip()
+                if not raw:
+                    continue
+                msg = json.loads(raw)
+                if msg.get("error"):
+                    sys.stdout.write("\n")
+                    print(f"  [--] download failed: {msg['error']}")
+                    return False
+                status = msg.get("status", "")
+                digest, total = msg.get("digest"), msg.get("total")
+                if digest and total:
+                    layers[digest] = (msg.get("completed", 0), total)
+                    done = sum(c for c, _ in layers.values())
+                    tot = sum(t for _, t in layers.values())
+                    _draw_bar("downloading", done, tot)
+                else:
+                    _draw_bar(status or "working", 0, 0)
+        sys.stdout.write("\n")
+        print(f"  [ok] {model} downloaded successfully")
+        return True
+    except OSError as e:
+        sys.stdout.write("\n")
+        print(f"  [--] download failed: {e}")
+        print(f"       you can retry by hand:  ollama pull {model}")
+        return False
+
+
+def _run_with_bar(label: str, cmd: list, cwd: str | None = None) -> int:
+    """Run a command that gives no parseable percentage (e.g. an image
+    build) while animating an indeterminate progress bar, so the step never
+    looks frozen. Returns the process return code; output stays captured."""
+    result: dict = {}
+
+    def _go():
+        result["proc"] = subprocess.run(cmd, cwd=cwd,
+                                         capture_output=True, text=True)
+
+    t = threading.Thread(target=_go, daemon=True)
+    t.start()
+    width, pos, span = 26, 0, 2 * (26 - 4)
+    while t.is_alive():
+        block = pos % span
+        if block > width - 4:        # bounce the lit block back across the bar
+            block = span - block
+        bar = ["."] * width
+        for i in range(4):
+            bar[block + i] = "#"
+        sys.stdout.write(f"\r  {label:<18.18} [{''.join(bar)}]   working ...   ")
+        sys.stdout.flush()
+        pos += 1
+        time.sleep(0.15)
+    t.join()
+    sys.stdout.write("\r" + " " * (width + 44) + "\r")   # clear the line
+    sys.stdout.flush()
+    return result["proc"].returncode if result.get("proc") else 1
+
+
+def _reboot_pending() -> bool:
+    """Windows: True if a reboot is queued (e.g. the Docker install just enabled
+    the WSL2 / Virtual Machine Platform features). Checks the standard pending-
+    reboot markers; returns False on any error or non-Windows, so we never block
+    setup on a bad read (Docker Desktop also prompts on first launch if needed)."""
+    checks = [
+        ["reg", "query", r"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion"
+         r"\Component Based Servicing\RebootPending"],
+        ["reg", "query", r"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion"
+         r"\WindowsUpdate\Auto Update\RebootRequired"],
+        ["reg", "query", r"HKLM\SYSTEM\CurrentControlSet\Control\Session Manager",
+         "/v", "PendingFileRenameOperations"],
+    ]
+    for cmd in checks:
+        try:
+            if subprocess.run(cmd, capture_output=True).returncode == 0:
+                return True
+        except OSError:
+            return False        # no `reg` (non-Windows): not our concern here
+    return False
+
+
+def _offer_restart() -> None:
+    """Windows: Docker's WSL2 setup needs a reboot. Ask whether to reboot now
+    (shutdown /r, cancellable with `shutdown /a`) or let the user do it. Either
+    way setup STOPS here -- it can't continue until WSL2 is active. The next
+    launch of WINDOWS_START_HERE.cmd resumes (everything is saved)."""
+    print()
+    if ask_yn("  reboot now to finish the install?", "y"):
+        subprocess.run(["shutdown", "/r", "/t", "10"])
+        print("\n  rebooting in 10 seconds (cancel with: shutdown /a). when "
+              "you're back,")
+        print("  double-click WINDOWS_START_HERE.cmd again to finish. your "
+              "progress is saved.")
+    else:
+        print("\n  ok. reboot your PC yourself, then double-click "
+              "WINDOWS_START_HERE.cmd")
+        print("  again to finish. your progress is saved.")
+        print("  (setup stops here: it can't continue until WSL2 is active "
+              "after the reboot.)")
+    # exit 2 (not 0): start.py then prints "finish later" instead of firing a
+    # doomed `docker compose run` (docker isn't usable until the reboot). the
+    # relaunch of WINDOWS_START_HERE.cmd after the reboot resumes.
+    sys.exit(2)
+
+
+def step_deps(advanced: bool = False) -> bool:
+    print("==== [2] dependencies " + "=" * 42)
     print()
     linux = sys.platform.startswith("linux")
     if linux and not (shutil.which("apt") or shutil.which("apt-get")):
@@ -795,7 +987,7 @@ def step_deps() -> bool:
                           text=True) if docker_bin else None
     daemon = info is not None and info.returncode == 0
     if daemon:
-        print("  [ok] docker is installed and running")
+        print(f'  [ok] docker detected at "{docker_bin}"')
         if subprocess.run(["docker", "compose", "version"],
                           capture_output=True).returncode == 0:
             print("  [ok] docker compose available")
@@ -811,8 +1003,9 @@ def step_deps() -> bool:
         if offer("sudo usermod -aG docker $USER",
                  "[--] docker is installed but your user isn't in the "
                  "docker group."):
-            print("  IMPORTANT: log OUT and back IN so the docker group")
-            print("  takes effect, then rerun: python3 setup.py")
+            print("  IMPORTANT: log out of your computer and back in so the")
+            print("  docker group takes effect, then open LINUX_START_HERE.sh "
+                  "again.")
     elif docker_bin and linux:
         ready = False
         offer("sudo systemctl enable --now docker",
@@ -823,8 +1016,9 @@ def step_deps() -> bool:
             if offer("sudo apt install -y docker.io docker-compose-v2 "
                      "&& sudo usermod -aG docker $USER",
                      "[--] docker is missing."):
-                print("  IMPORTANT: log OUT and back IN so the docker group")
-                print("  takes effect, then rerun: python3 setup.py")
+                print("  IMPORTANT: log out of your computer and back in so the")
+                print("  docker group takes effect, then open "
+                      "LINUX_START_HERE.sh again.")
         elif docker_bin:
             print("  [--] docker is installed but not running; open the")
             print("       Docker Desktop app, wait for it to start, rerun")
@@ -832,14 +1026,24 @@ def step_deps() -> bool:
             if offer("winget install -e --id Docker.DockerDesktop "
                      "--accept-package-agreements --accept-source-agreements",
                      "[--] docker is missing.", admin=False):
-                print("  installed. Docker Desktop needs WSL2 and a reboot:")
-                print("  reboot, launch Docker Desktop once so the engine")
-                print("  starts, then rerun: python start.py")
+                print("  docker installed successfully. (Docker Desktop makes")
+                print("  you sign in the first time: a free Docker account or")
+                print("  'Continue with Google' works.)")
+                if _reboot_pending():
+                    print("  a reboot is required to finish enabling WSL2.")
+                    _offer_restart()         # offers reboot, then stops setup
+                else:
+                    print("  no reboot needed: open Docker Desktop, sign in, and")
+                    print("  setup keeps going (rerun WINDOWS_START_HERE.cmd "
+                          "anytime).")
         else:
             print("  [--] docker is missing; install Docker Desktop:")
             print("       https://docs.docker.com/desktop/")
+            print("       (it makes you sign in the first time: a free")
+            print("        Docker account or 'Continue with Google' works)")
 
     have = _ollama_models()
+    ollama_was_present = have is not None
     if have is None:
         if linux:
             if not shutil.which("curl"):
@@ -861,14 +1065,23 @@ def step_deps() -> bool:
         else:
             print("  [--] ollama is not installed; download it:")
             print("       https://ollama.com/download")
-    if judge_model() == "mistral-nemo":
-        print("  NOTE: the default judge model 'mistral-nemo' is a ~7 GB")
-        print("  download and wants ~8 GB+ of free RAM (or a GPU). It still")
-        print("  runs on a low-RAM PC, just slowly. For a much lighter judge,")
-        print("  set 'judge:' in config/config.yaml to a small model such as")
-        print("  llama3.2:3b (~2 GB) -- or switch it later from the Discord bot")
-        print("  with !model. On a slow PC, also lower 'max_jobs'.")
-        print()
+
+    # advanced mode runs the bot inside a discord.py-equipped image; build it
+    # here (BEFORE the model blobs) so it doesn't stall on first launch. the
+    # Discord ACCOUNT was already confirmed back in step_choose.
+    if advanced and daemon:
+        # auto-build (no gate): the user already opted into advanced + has an
+        # account, so just do it and report status like the other deps
+        print("  [ok] discord is installing")
+        rc = _run_with_bar("discord", ["docker", "compose", "--profile",
+                                       "advanced", "build", "bot"],
+                           cwd=str(HERE))
+        if rc == 0:
+            print("  [ok] discord installed successfully")
+        else:
+            ready = False
+            print("  [--] bot build failed; it'll retry on first run")
+
     if have is None:
         ready = False
         judge = judge_model()
@@ -876,20 +1089,25 @@ def step_deps() -> bool:
               f"&& ollama pull {judge}")
         print("  (no GPU? see the 'No GPU?' note in docs/manual-setup.md)")
     else:
-        print("  [ok] ollama is running")
-        judge = judge_model()
+        if ollama_was_present:
+            ob = shutil.which("ollama")
+            print(f'  [ok] ollama detected at "{ob}"' if ob
+                  else "  [ok] ollama detected (running)")
+        else:
+            print("  [ok] ollama installed successfully")
+        step_model(have)            # AI-blob section: choose the judge, then
+        judge = judge_model()       # download ONLY it + the embedder below
+        # no gate here: confirming the model above IS the consent. just pull
+        # the embedder + the chosen judge, nothing else
         for model in ("nomic-embed-text", judge):
             # exact match when a tag like :3b is specified; base match
             # only for untagged names (resolves to :latest)
             if _model_present(model, have):
-                print(f"  [ok] model {model} downloaded")
-            elif not offer(f"ollama pull {model}",
-                           f"[--] model {model} is missing (big download).",
-                           admin=False):
+                print(f"  [ok] {model} already downloaded")
+            elif not _pull_model(model):
                 ready = False
         if linux:
-            if OVERRIDE.exists() and "0.0.0.0" in OVERRIDE.read_text(
-                    encoding="utf-8"):
+            if OVERRIDE.exists() and "0.0.0.0" in OVERRIDE.read_text():
                 print("  [ok] Docker-to-ollama networking fix already applied")
             else:
                 fix = ("sudo mkdir -p /etc/systemd/system/ollama.service.d && "
@@ -917,12 +1135,28 @@ def _check_token(tok: str) -> str | None:
         return None
 
 
+def _invite_url(token: str) -> str | None:
+    """One-click invite URL built from the token's application id, with
+    exactly the perms the bot uses: Send Messages (0x800) + Attach Files
+    (0x8000) + Read Message History (0x10000) = 100352. Saves the user from
+    hand-navigating the dev portal's OAuth2 URL Generator."""
+    req = urllib.request.Request(
+        "https://discord.com/api/v10/users/@me",
+        headers={"Authorization": f"Bot {token}", "User-Agent": "automatch-setup"})
+    try:
+        with urllib.request.urlopen(req, timeout=8) as r:
+            app_id = json.load(r).get("id")
+    except OSError:
+        return None
+    if not app_id:
+        return None
+    return (f"https://discord.com/oauth2/authorize?client_id={app_id}"
+            "&scope=bot&permissions=100352")
+
+
 def _install_cli() -> bool:
-    """Install a global `automatch` command that starts the bot from anywhere.
-    It just RUNS the bot -- no --build -- because the container was already
-    downloaded during setup (start.py's 'ready to begin?' step); compose still
-    builds on its own if the image is somehow missing. Generated per-OS.
-    Returns True when it's ready to use."""
+    """Install a global `automatch` command that starts the bot from
+    anywhere. Generated per-OS. Returns True when it's ready to use."""
     try:
         if os.name == "nt":      # native Windows: a .bat on the default PATH
             bindir = (Path(os.environ.get("LOCALAPPDATA", ""))
@@ -932,8 +1166,7 @@ def _install_cli() -> bool:
             (bindir / "automatch.bat").write_text(
                 "@echo off\r\n"
                 f'cd /d "{HERE}"\r\n'
-                "docker compose --profile advanced run --rm bot\r\n",
-                encoding="utf-8")
+                "docker compose --profile advanced run --build --rm bot\r\n")
             return True
         bindir = Path.home() / ".local" / "bin"   # linux / mac / WSL
         bindir.mkdir(parents=True, exist_ok=True)
@@ -942,8 +1175,7 @@ def _install_cli() -> bool:
             "#!/bin/sh\n"
             f'cd "{HERE}" || exit 1\n'
             'exec env UID="$(id -u)" GID="$(id -g)" '
-            "docker compose --profile advanced run --rm bot\n",
-            encoding="utf-8")
+            "docker compose --profile advanced run --build --rm bot\n")
         cli.chmod(0o755)
         return str(bindir) in os.environ.get("PATH", "")
     except OSError:
@@ -979,32 +1211,36 @@ def _write_env(updates: dict) -> None:
     """Update .env keeping every non-DISCORD line that's already there."""
     lines = []
     if ENV.exists():
-        lines = [l for l in ENV.read_text(encoding="utf-8").splitlines()
+        lines = [l for l in ENV.read_text().splitlines()
                  if not l.startswith("DISCORD_")]
     lines += [f"{k}={v}" for k, v in updates.items() if v]
-    ENV.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    print(f"  wrote {ENV} (keep this file secret; it's git/docker-ignored)")
+    ENV.write_text("\n".join(lines) + "\n")
 
 
 def step_choose() -> bool:
-    head("setup type")
+    print("==== [1] setup type " + "=" * 44)
     print()
-    print("  would you like to set up the ADVANCED setup?")
+    print("  basic:    scrape jobs, score them your way, outputs a ranked")
+    print("            matches.html")
     print()
-    print("  advanced: adds beat-the-ATS custom resumes. a free Discord bot")
-    print("  (https://discord.com/developers/applications) asks which skills")
-    print(f"  each job wants and swaps your answer into the {MARKER} in your")
-    print("  resume, saved to output/resumes/. more setup, more capable.")
+    print("  advanced: also builds a custom resume for each job, sent to you")
+    print("            by a Discord bot (more involved setup, more capable.)")
     print()
-    print("  basic: scrape jobs -> score them YOUR way -> ranked matches.html.")
-    print("  fill one file, run one command.")
+    if not ask_yn("use the advanced setup?\n ", "n"):
+        return False
+    # advanced REQUIRES a Discord account; a script can't create one, so just
+    # make sure they have it (open the signup page) before going further
+    print("  advanced needs a free Discord account.")
+    print("  don't have one? make one here: https://discord.com/register")
     print()
-    return ask_yn("go with the ADVANCED setup?", "n")
+    while not ask_yn("  do you have a Discord account?", "y"):
+        print("  make one first (free, ~1 min): https://discord.com/register")
+    return True
 
 
-def step_discord() -> None:
-    """ADVANCED ONLY: bot credentials walkthrough -> .env."""
-    head("discord bot", gap=True)
+def step_discord() -> bool:
+    """[6/6] ADVANCED ONLY: bot credentials walkthrough -> .env."""
+    print("\n==== [6] discord bot " + "=" * 43)
     print()
     (HERE / "output" / "resumes").mkdir(parents=True, exist_ok=True)
     print("  the bot talks to you over Discord DMs; these exact settings")
@@ -1031,16 +1267,10 @@ def step_discord() -> None:
     print("        Intents (REQUIRED: the bot cannot start without it)")
     print("      - Reset Token -> copy it (the PRIVATE key; paste it only")
     print("        here, never share it)")
-    print()
-    print("      HEADS UP: the box below is INVISIBLE on purpose (it hides")
-    print("      your secret token). Your PASTE still works even though you")
-    print("      see nothing -- right-click, or Ctrl+V / Ctrl+Shift+V. Just")
-    print("      paste once and press ENTER to continue; it'll confirm how")
-    print("      many characters it got.")
     token = ""
     while not token:
         token = ask_secret("      user input (paste the PRIVATE token, "
-                           "then press ENTER -- nothing will show): ")
+                           "then enter): ")
         if token and ask_yn("    show the token to double-check it?", "n"):
             print(f"      token: {token}")
         if token:
@@ -1052,18 +1282,20 @@ def step_discord() -> None:
                 token = ""
 
     print()
-    print("   4. let the bot DM you: when setup finishes, the bot starts")
-    print("      the conversation in your DMs. discord only delivers a")
-    print("      bot's DMs if you share a server with it, so add it to")
-    print("      one (a private server with just you works fine):")
-    print("      page: https://discord.com/developers/applications")
-    print("      -> your app -> OAuth2 -> URL Generator, then:")
-    print("        a) in the SCOPES list, tick the 'bot' box (just that one)")
-    print("        b) a 'BOT PERMISSIONS' box now appears below -- in it tick:")
-    print("           'Send Messages', 'Attach Files', 'Read Message History'")
-    print("        c) scroll to the bottom, click 'Copy' on the GENERATED URL")
-    print("        d) paste that URL in your browser -> pick your server")
-    print("           (the private one with just you) -> Authorize")
+    print("   4. add the bot to a server so it can DM you. (it talks to you in")
+    print("      DMs; a server is just how Discord links you and the bot.)")
+    invite = _invite_url(token)
+    if invite:
+        print("      - no server yet? in Discord, click the + on the left ->")
+        print("        'Create My Own' -> 'For me and my friends' (10 seconds)")
+        print("      - then open THIS link to add your bot to that server:")
+        print(f"        {invite}")
+        print("      - pick your server -> Authorize")
+    else:
+        print("      couldn't auto-build the invite link (token/network?); in")
+        print("      the dev portal: your app -> OAuth2 -> URL Generator ->")
+        print("      scope 'bot' + perms Send Messages / Attach Files / Read")
+        print("      Message History -> open the URL -> pick your server")
     input("      --> enter ")
 
     print()
@@ -1088,59 +1320,74 @@ def step_discord() -> None:
             "in the project folder")
     print()
     _hello_ping(token, uid, cid, hint)
-    # The "how to start" instructions are printed once, at the very end of the
-    # run (start.py's closing banner, or GO.bat's terminal landing), so don't
-    # repeat them here -- the user would otherwise see the same thing 2-3 times.
+    return cli_ok
 
 
 def main() -> None:
     # user-owned BEFORE docker can create it as root on a fresh clone
     (HERE / "output").mkdir(exist_ok=True)
+    # .env is gitignored, so a fresh clone ships without one; create it up
+    # front so nothing downstream (compose, the bot build) trips on it missing
+    if not ENV.exists():
+        ENV.write_text("")
     print("=" * 66)
     print("  automatch setup: answer a few questions, then it just runs")
     print("=" * 66)
     print()
     advanced = step_choose()
-    # bootstrap.py (the setup doctor / first stage) already installs and
-    # verifies every dependency, then sets AUTOMATCH_DEPS_OK before handing
-    # off. Honour it so we don't run the whole [2] dependencies pass again and
-    # make the user sit through the same install checks a second time.
-    if os.environ.get("AUTOMATCH_DEPS_OK") == "1":
-        ready = True
-    else:
-        ready = step_deps()         # installs first: the questionnaire's
-        print()                     # spellcheck needs ollama running
+    ready = step_deps(advanced)     # installs first: the questionnaire's
+    print()                         # spellcheck needs ollama running
     redo = not PROFILE.exists() or ask_yn(
         "config/profile.yaml already exists\n  redo it from scratch?", "n")
+    spell = None                    # background spell-check handle
+    spell_out, spell_report = {}, []
     if redo:
         s = step_search()
         metrics, s["threshold"], s["wildcard"] = step_metrics()
-        s, metrics = spellfix(s, metrics)
-        write_profile(s, metrics)
+        # spell-check is the slow part on a weak CPU (one model call per
+        # answer). Run it in the background while the user does the resume +
+        # Discord steps, then join it just before writing the profile, so a
+        # slow machine never stalls the questionnaire.
+        def _spell():
+            try:
+                spell_out["s"], spell_out["metrics"] = spellfix(
+                    s, metrics, quiet=True, report=spell_report)
+            except Exception:       # never lose the answers to a spell-fail
+                spell_out["s"], spell_out["metrics"] = s, metrics
+        spell = threading.Thread(target=_spell, daemon=True)
+        spell.start()
     else:
         print("  keeping your existing profile.")
     step_resume(advanced)
+    cli_ok = True
     if advanced:
-        step_discord()
-    # When start.py launched us it prints the first-run next-steps itself (with
-    # the build prompt), so skip this banner to avoid two closing screens.
-    # Standalone `python setup.py` still shows it -- it's the only ending then.
-    if os.environ.get("AUTOMATCH_FROM_START") == "1":
-        sys.exit(0 if ready else 2)
-    print("\n" + "=" * 66)
-    if ready and RESUME.exists():
-        print("  everything is ready. run it:")
-    else:
-        print("  finish the [--] items above, then run it:")
-    if os.name == "nt":
-        print('    docker compose run --rm automatch run -r 5   # small test')
-    else:
-        print('    env UID=$(id -u) GID=$(id -g) docker compose run --rm \\')
-        print('        automatch run -r 5                       # small test')
-    print(f"    {PY} start.py                             # the real thing")
+        cli_ok = step_discord()
+    if spell is not None:
+        if spell.is_alive():
+            print("\n  finishing spell-check of your answers...")
+        spell.join()
+        for line in spell_report:
+            print(line)
+        write_profile(spell_out["s"], spell_out["metrics"])
+    print()
+    if not (ready and RESUME.exists()):
+        print("  (finish the [--] items flagged above first)")
+        print()
     if advanced:
-        print("    automatch                            # ATS bot; DM it `!match`")
-    print("=" * 66)
+        start = ('"automatch"' if cli_ok else
+                 '"docker compose --profile advanced run --rm bot"')
+        print(f"  to start the bot: run {start} in the terminal and keep it")
+        print("  open. then in Discord, reply to the bot's DM with !match to")
+        print("  start the program.")
+        print()
+        print(f"  to re-run later (no setup needed): run {start} again and send")
+        print("  commands to the bot's DMs. !commands lists them all.")
+    else:
+        print(f"  to run it (anytime, no setup needed): {PY} start.py")
+    if DONATE:
+        print()
+        print("  thank you for using my software! if you find it useful and")
+        print(f"  can spare a dollar, the donation link is: {DONATE}")
     sys.exit(0 if ready else 2)    # 2 -> start.py knows not to run docker yet
 
 

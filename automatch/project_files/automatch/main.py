@@ -164,6 +164,8 @@ def main() -> None:
 
     cfg = apply_profile(load_yaml(paths.CONFIG))
     vectors = cfg.pop("vectors", None)
+    if vectors is None and paths.VECTORS.exists():      # legacy fallback
+        vectors = (load_yaml(paths.VECTORS) or {}).get("vectors")
     if not vectors:
         raise SystemExit(
             "No scoring vectors. Add a 'vectors:' section to config/profile.yaml")

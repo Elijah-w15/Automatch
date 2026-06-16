@@ -5,9 +5,10 @@ Commands (owner-only):
   !scrape    scrape + score + rank only; posts the top list
   !build     resume builder on the ALREADY scraped + rated jobs:
              per job, click the skill button you have, or Skip
+  !model     show / switch the local scoring model (1-4)
   !tag       show / add / remove approved skills
-  !model     show / switch the judge model stack (downloads + saves it)
-  !jobs      show / cap how many jobs each run scores (lower on a slow PC)
+  !pause     stop the current run; progress is saved
+  !edit      how to change config (metrics, search, resume, ...) in the terminal
   !commands  help
 
 Decisions persist: answered jobs are never re-asked (output/
@@ -19,7 +20,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-import re
+import threading
 
 import discord
 import requests
@@ -29,55 +30,39 @@ from . import paths, rank, scrape, score, tailor
 TOP_N = 10
 REPLY_TIMEOUT = 600          # seconds to wait for a button click
 
-# --- switchable judge stack: change the scoring model live from Discord ----
-# Tradeoffs are about the HOST machine running ollama: a bigger judge scores
-# the rubric more sharply but needs more RAM/VRAM and runs slower. On a weak
-# PC, pick a small judge AND cap jobs per run with !jobs (scoring is minutes
-# per job there). Any exact ollama tag also works; this is just the curated
-# shortlist shown by !model.
-JUDGE_MODELS = [
-    ("llama3.2:3b",  "~2 GB. Runs on almost any PC (4-8 GB RAM, no GPU) and "
-                     "stays fast. Judgment is a little blunter. Best for "
-                     "old/slow machines."),
-    ("qwen2.5:7b",   "~5 GB. Wants ~8 GB RAM. Strong reasoning for its size; "
-                     "a solid middle ground."),
-    ("mistral-nemo", "~7 GB. Wants ~8 GB+ RAM or a GPU. Best scoring quality "
-                     "(the default). Slow on weak machines."),
-]
+# the judge models setup's picker offers; !model <n> switches between them
+JUDGE_TIERS = ["llama3.1:8b", "mistral-nemo", "qwen2.5:14b", "qwen2.5:32b"]
 
 
-def _yaml_set(key: str, value: str, path=None) -> int:
-    """Replace `key: value` on its line in a yaml file, in place, keeping
-    indentation and any trailing comment. Used for the flat, unique keys
-    `judge` and `max_jobs` (each appears once in the file). Returns how many
-    lines were replaced (0 if the key wasn't present)."""
-    path = path or paths.CONFIG
-    if not path.exists():
-        return 0
-    text = path.read_text()
-
-    def repl(m: re.Match) -> str:
-        comment = (m.group("comment") or "").rstrip()
-        tail = "  " + comment if comment else ""
-        return f"{m.group('indent')}{key}: {value}{tail}"
-
-    new, n = re.subn(
-        rf"(?m)^(?P<indent>\s*){re.escape(key)}:(?P<val>[^#\n]*)"
-        r"(?P<comment>#[^\n]*)?$", repl, text, count=1)
-    if n:
-        path.write_text(new)
-    return n
+def _write_judge(model: str) -> None:
+    """Persist the chosen judge to config.yaml so it survives a bot restart."""
+    try:
+        lines = paths.CONFIG.read_text().splitlines()
+    except OSError:
+        return
+    for i, line in enumerate(lines):
+        if line.strip().startswith("judge:"):
+            indent = line[:len(line) - len(line.lstrip())]
+            lines[i] = f'{indent}judge: "{model}"'
+            paths.CONFIG.write_text("\n".join(lines) + "\n")
+            return
 
 
-def _pull_model(host: str, model: str) -> None:
-    """Download a model into ollama, blocking until done. ollama returns 200
-    even for an unknown model (with an 'error' field), so check for that."""
-    r = requests.post(f"{host}/api/pull",
-                      json={"name": model, "stream": False}, timeout=3600)
-    r.raise_for_status()
-    body = r.json() if r.content else {}
-    if body.get("error"):
-        raise RuntimeError(body["error"])
+def _model_pulled(host: str, model: str) -> bool:
+    try:
+        tags = requests.get(f"{host}/api/tags",
+                            timeout=10).json().get("models", [])
+    except (requests.RequestException, ValueError):
+        return False
+    base = model.split(":")[0]
+    return any(m.get("name") == model or m.get("name", "").split(":")[0] == base
+               for m in tags)
+
+
+def _pull(host: str, model: str) -> None:
+    # stream=False: one blocking call that returns when the pull completes
+    requests.post(f"{host}/api/pull", json={"model": model, "stream": False},
+                  timeout=None).raise_for_status()
 
 
 def _top_jobs() -> list[dict]:
@@ -158,12 +143,40 @@ HELP = ("**commands**\n"
         "`!tag`: show your approved skills\n"
         "`!tag <skill>`: add a skill (auto-applies, never asked again)\n"
         "`!tag remove <skill>`: forget one\n"
-        "`!model`: show the judge-model stack and what each is good for\n"
-        "`!model <name>`: switch the scoring model (downloads it, saves it)\n"
-        "`!switchmodel <name>` (alias `!switch`): same as `!model <name>`\n"
-        "`!jobs`: show the per-run job cap\n"
-        "`!jobs <n>`: cap jobs per run (lower on a slow PC)\n"
-        "`!commands`: this list")
+        "`!model` / `!model 1-4`: show or switch the local scoring model "
+        "(re-scores on your next `!scrape`)\n"
+        "`!pause` (or `!stop`): stop the current scrape/score run; progress "
+        "is saved and `!scrape` resumes it\n"
+        "`!edit` (or `!metric`): how to change your metrics, job search, "
+        "Discord login, or resume (done in the terminal)\n"
+        "`!commands`: this list\n"
+        "\n"
+        "**in the terminal** (where you launched the bot)\n"
+        "`automatch`: start this bot; keep that window open while you use it. "
+        "run it again anytime to restart (no setup needed)\n"
+        "`python3 edit.py`: change metrics, job search, Discord login, or "
+        "resume\n"
+        "`python3 setup.py`: redo the one-time setup (scoring rubric, model, "
+        "job search, or Discord settings)")
+
+
+def _reload_profile():
+    """Re-read config.yaml + profile.yaml from disk so edits made while the bot
+    is running (metrics via edit_metrics.py, threshold, search terms, the
+    persisted judge) apply on the next !scrape with NO restart. Returns
+    (cfg, vectors), or None if the profile is missing/invalid -- the caller then
+    keeps the last good settings instead of letting a bad edit crash the bot."""
+    try:
+        from . import main           # lazy: avoids a circular import at load
+        cfg = main.apply_profile(main.load_yaml(paths.CONFIG))
+        vectors = cfg.pop("vectors", None)
+        if vectors is None and paths.VECTORS.exists():
+            vectors = (main.load_yaml(paths.VECTORS) or {}).get("vectors")
+        if not vectors:
+            return None
+        return cfg, vectors
+    except (SystemExit, Exception):   # _die() raises SystemExit on a bad profile
+        return None
 
 
 def run(cfg: dict, vectors: dict) -> None:
@@ -176,6 +189,7 @@ def run(cfg: dict, vectors: dict) -> None:
     intents.message_content = True    # privileged: enable it in the dev portal
     client = discord.Client(intents=intents)
     busy = {"on": False}
+    cancel = threading.Event()       # set by !pause; read inside the worker
     env_uid = os.environ.get("DISCORD_USER_ID", "").strip()
     owner = {"id": int(env_uid) if env_uid.isdigit() else None}
 
@@ -190,17 +204,47 @@ def run(cfg: dict, vectors: dict) -> None:
 
     async def refresh(ch):
         """scrape -> score -> rank; returns the top jobs (or [])."""
+        nonlocal cfg, vectors
+        cancel.clear()                  # a stale !pause must not kill this run
+        fresh = await asyncio.to_thread(_reload_profile)
+        if fresh:                       # adopt profile.yaml edits, no restart
+            cfg, vectors = fresh
+        else:
+            await ch.send("note: config/profile.yaml didn't reload (missing or "
+                          "mid-edit?); using the settings from bot startup")
         await ch.send("on it: scraping fresh postings...")
         lock = paths.PipelineLock()
+        if not await asyncio.to_thread(lock.try_acquire):
+            # never block forever: a terminal closed mid-run can leave a
+            # container alive still holding the lock, which used to wedge the
+            # bot silently ("stuck mid-scrape"). Wait a few seconds, then bail
+            # with an actionable message instead of hanging.
+            await ch.send("another automatch run is already going; giving it "
+                          "a moment...")
+            for _ in range(10):
+                await asyncio.sleep(1)
+                if await asyncio.to_thread(lock.try_acquire):
+                    break
+            else:
+                lock.release()
+                await ch.send("still locked. if you closed a terminal mid-run, "
+                              "that container may still be alive holding the "
+                              "lock; stop it (`docker compose down`), then "
+                              "try `!scrape` again")
+                return []
         try:
-            if not await asyncio.to_thread(lock.try_acquire):
-                await ch.send("another automatch run is in progress; "
-                              "waiting for it to finish...")
-                await asyncio.to_thread(lock.wait)
-            new = await asyncio.to_thread(scrape.run, cfg, None)
+            new = await asyncio.to_thread(scrape.run, cfg, None, cancel.is_set)
+            if cancel.is_set():
+                await ch.send("⏸️ paused. what scraped so far is saved; "
+                              "`!scrape` picks up where it left off")
+                return []
             await ch.send(f"{new} new postings. scoring against your rubric "
                           "(the slow part)...")
-            await asyncio.to_thread(score.run, cfg, vectors)
+            await asyncio.to_thread(score.run, cfg, vectors, cancel.is_set)
+            if cancel.is_set():
+                await ch.send("⏸️ paused mid-scoring. scored jobs are saved; "
+                              "`!scrape` resumes the rest")
+                return []
             await asyncio.to_thread(rank.run, cfg, vectors)
         finally:
             lock.release()
@@ -231,13 +275,8 @@ def run(cfg: dict, vectors: dict) -> None:
         for i, job in enumerate(jobs, 1):
             url = job.get("url") or ""
             tag = "🃏 WILD CARD" if job.get("wildcard") else f"#{i}"
-            score_bits = [f"exp={job.get('level') or '?'}",
-                          f"cos={float(job.get('cosine') or 0):.2f}"]
-            score_bits += [f"{k}={float(v):.2f}"
-                           for k, v in (job.get("vectors") or {}).items()]
             head = (f"---\n**{tag}: {job['title'][:80]} @ "
-                    f"{str(job['company'])[:40]}**\n{job['url']}\n"
-                    f"score **{job.get('score')}**  ·  {', '.join(score_bits)}")
+                    f"{str(job['company'])[:40]}**\n{job['url']}")
             if job.get("day_to_day"):
                 head += f"\n_{str(job['day_to_day'])[:300]}_"
             if url in choices:               # answered in an earlier round
@@ -336,64 +375,25 @@ def run(cfg: dict, vectors: dict) -> None:
             await ch.send(f"✅ **{arg}** added; jobs wanting it will get it "
                           "auto-applied, and you won't be asked about it")
 
-    async def do_model(ch, arg: str):
+    async def do_model(ch, n):
+        model = JUDGE_TIERS[n - 1]
+        if model == str(cfg["models"].get("judge")):
+            await ch.send(f"already using **{model}**")
+            return
         host = score.ollama_host(cfg)
-        cur = cfg["models"].get("judge", "")
-        if not arg:
-            lines = [f"**judge model** — the host LLM that scores every job. "
-                     f"current: **{cur}**", "",
-                     "bigger = sharper scoring, but more RAM/VRAM and slower. "
-                     "switch with `!model <name>`:", ""]
-            for name, blurb in JUDGE_MODELS:
-                mark = "  ← current" if name == cur else ""
-                lines.append(f"**{name}**{mark}\n  {blurb}")
-            lines.append("\non a slow PC, also shrink the workload: `!jobs 5`")
-            await _send(ch, "\n".join(lines))
-            return
-        model = arg.split()[0]
-        known = [n for n, _ in JUDGE_MODELS]
-        if model not in known and ":" not in model and "/" not in model:
-            await ch.send(f"unknown model `{model}`. pick one of "
-                          + ", ".join(f"`{n}`" for n in known)
-                          + ", or pass any exact ollama tag (e.g. `llama3.1:8b`).")
-            return
-        await ch.send(f"pulling **{model}** into ollama — the first time this "
-                      "can take a few minutes (big download)...")
-        try:
-            await asyncio.to_thread(_pull_model, host, model)
-        except Exception as e:
-            await ch.send(f"⚠️ couldn't pull `{model}`: {type(e).__name__}: "
-                          f"{str(e)[:200]}\njudge unchanged (still `{cur}`). "
-                          "is ollama running on the host?")
-            return
-        _yaml_set("judge", f'"{model}"')
-        cfg["models"]["judge"] = model        # also applies this session
-        await ch.send(f"✅ judge model is now **{model}** (saved to config). "
-                      "your next `!match` or `!scrape` uses it.")
-
-    async def do_jobs(ch, arg: str):
-        cur = cfg.get("scrape", {}).get("max_jobs", 250)
-        if not arg:
-            await _send(ch, f"**jobs per run:** {cur}\n"
-                        "this caps how many fresh postings each run scrapes and "
-                        "scores. scoring is the slow part (minutes per job on a "
-                        "CPU), so lower it on a weak PC. change: `!jobs <number>` "
-                        "(e.g. `!jobs 5`).")
-            return
-        if not arg.strip().isdigit() or int(arg.strip()) < 1:
-            await ch.send("give a whole number ≥ 1, e.g. `!jobs 5`")
-            return
-        n = int(arg.strip())
-        # profile.yaml's max_jobs OVERRIDES config.yaml's on every load
-        # (main.apply_profile), so writing only config.yaml would silently
-        # revert on the next restart. Persist to profile.yaml when it carries
-        # the key (the wizard writes it there by default); keep config.yaml in
-        # sync as the fallback for a profile that doesn't set it.
-        _yaml_set("max_jobs", str(n))
-        _yaml_set("max_jobs", str(n), path=paths.PROFILE)
-        cfg.setdefault("scrape", {})["max_jobs"] = n
-        await ch.send(f"✅ jobs per run capped at **{n}**. lower = faster runs on "
-                      "a weak PC; raise it for more coverage.")
+        if not await asyncio.to_thread(_model_pulled, host, model):
+            await ch.send(f"downloading **{model}** (one-time; can take a few "
+                          "minutes)...")
+            try:
+                await asyncio.to_thread(_pull, host, model)
+            except Exception as e:
+                await ch.send(f"couldn't download {model}: {type(e).__name__}; "
+                              "model unchanged")
+                return
+        cfg["models"]["judge"] = model      # propagate to THIS running session
+        _write_judge(model)                 # and persist for the next start
+        await ch.send(f"✅ scoring model is now **{model}**. your next "
+                      "`!scrape` re-scores your jobs with it")
 
     @client.event
     async def on_ready():
@@ -418,18 +418,43 @@ def run(cfg: dict, vectors: dict) -> None:
             await guarded(msg.channel, do_scrape(msg.channel))
         elif low == "!build":
             await guarded(msg.channel, do_build(msg.channel))
+        elif low in ("!pause", "!stop"):
+            if busy["on"]:
+                cancel.set()
+                await msg.channel.send("⏸️ pausing once the current step "
+                                       "finishes; everything so far is saved")
+            else:
+                await msg.channel.send("nothing is running right now")
+        elif low == "!model" or low.startswith("!model "):
+            arg = text[6:].strip()
+            cur = str(cfg["models"].get("judge", "?"))
+            if not arg:
+                lst = "\n".join(
+                    f"`{i}.` {m}" + ("  <- current" if m == cur else "")
+                    for i, m in enumerate(JUDGE_TIERS, 1))
+                await _send(msg.channel, f"**scoring model** (now: {cur})\n"
+                            f"{lst}\nsend `!model 1`-`4` to switch")
+            elif arg in ("1", "2", "3", "4"):
+                if busy["on"]:
+                    await msg.channel.send("a run is in progress; `!pause` "
+                                           "first, then switch models")
+                else:
+                    await guarded(msg.channel, do_model(msg.channel, int(arg)))
+            else:
+                await msg.channel.send("use `!model 1`-`4` (or `!model` to "
+                                       "see the options)")
         elif low in ("!commands", "!comands", "!help"):
             await _send(msg.channel, HELP)
+        elif (low in ("!metric", "!metrics", "!edit", "!search", "!resume",
+                      "!discord")
+              or low.startswith(("!metric ", "!edit "))):
+            await msg.channel.send(
+                "to change your config, run `python3 edit.py` in the terminal "
+                "(the project folder): scoring metrics, job search, Discord "
+                "login, or resume. metric + search edits apply on your next "
+                "`!scrape` (no restart); a Discord-login change needs a restart.")
         elif low == "!tag" or low.startswith("!tag "):
             await do_tag(msg.channel, text[4:].strip())
-        elif low == "!model" or low.startswith("!model "):
-            await do_model(msg.channel, text[6:].strip())
-        elif low in ("!switchmodel", "!switch") or low.startswith(
-                ("!switchmodel ", "!switch ")):
-            await do_model(msg.channel, text.split(None, 1)[1].strip()
-                           if " " in text else "")
-        elif low == "!jobs" or low.startswith("!jobs "):
-            await do_jobs(msg.channel, text[5:].strip())
 
     try:
         client.run(token)

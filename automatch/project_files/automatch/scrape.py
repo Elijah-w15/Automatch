@@ -5,6 +5,7 @@ re-runs only add NEW jobs.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
@@ -62,6 +63,22 @@ def dedupe_key(row: dict, *, loose: bool = True) -> tuple[str, str]:
             re.sub(r"[^a-z0-9]+", "", city.lower()))
 
 
+def desc_fingerprint(text: str, *, min_len: int = 400) -> str | None:
+    """A CONTENT key that collapses the same posting cross-listed under a
+    different title, which the title+company key misses: 'Data Scientist'
+    and 'Associate Data Scientist' at one employer are often the identical
+    posting. Matches on the FULL normalized body, never a prefix: two
+    genuinely different roles at one employer routinely share a company
+    boilerplate intro (e.g. Crusoe's Manufacturing vs Electrical Engineer
+    share ~1100 chars, then diverge) and must NOT be folded together.
+    Returns None for short/empty bodies so description-less jobs never
+    collapse into one another."""
+    norm = re.sub(r"[^a-z0-9]+", " ", str(text or "").lower()).strip()
+    if len(norm) < min_len:
+        return None
+    return hashlib.md5(norm.encode()).hexdigest()
+
+
 def prune(hours_old: int) -> None:
     """Each new scrape clears rows older than the user's listing-age
     window from jobs.jsonl and scores.jsonl so they never grow forever
@@ -89,7 +106,8 @@ def prune(hours_old: int) -> None:
               f"from {path.name}", flush=True)
 
 
-def run(cfg: dict, results_override: int | None = None) -> int:
+def run(cfg: dict, results_override: int | None = None,
+        should_cancel=None) -> int:
     scfg = cfg["scrape"]
     cap = int(scfg.get("max_jobs", 250))
     hours_old = scfg.get("hours_old", 72)
@@ -99,20 +117,14 @@ def run(cfg: dict, results_override: int | None = None) -> int:
     terms = scfg["search_terms"]
     written = 0
 
-    # heal a torn last line: a hard kill mid-write can leave jobs.jsonl without
-    # a trailing newline; appending would then fuse our first row onto that
-    # fragment on one physical line, and read_jsonl would drop BOTH. A one-byte
-    # peek + separator newline isolates the unparseable fragment on its own line.
-    torn = False
-    if paths.JOBS.exists() and paths.JOBS.stat().st_size:
-        with paths.JOBS.open("rb") as chk:
-            chk.seek(-1, os.SEEK_END)
-            torn = chk.read(1) != b"\n"
-
     with paths.JOBS.open("a") as out:
-        if torn:
-            out.write("\n")
         for i, term in enumerate(terms):
+            # cooperative pause (Discord !pause): every finished term is
+            # already fsync'd, so bailing here loses nothing
+            if should_cancel and should_cancel():
+                print("=== paused; finished search terms are saved ===",
+                      flush=True)
+                break
             if written >= cap:
                 print(f"=== max_jobs cap ({cap}) reached; stopping ===", flush=True)
                 break
@@ -153,7 +165,8 @@ def run(cfg: dict, results_override: int | None = None) -> int:
                 # industry ("construction" kills a construction firm's
                 # Project Engineer posting, "amazon" kills all of Amazon's)
                 blob = " ".join(str(job.get(k) or "") for k in
-                                ("title", "company", "company_industry"))
+                                ("title", "company", "company_industry",
+                                 "description"))
                 if not url or url in seen:
                     continue
                 if any(word_match(x, blob) for x in excludes):

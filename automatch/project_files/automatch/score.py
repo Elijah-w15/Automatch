@@ -36,77 +36,33 @@ def clean_text(s: str) -> str:
     return re.sub(r"\s+", " ", s).strip()
 
 
-# Contact details that ONLY appear in a real (un-stripped) header block.
-# Deliberately NOT the bullet "•": resumes use • as list bullets too, so its
-# presence must not be read as "this resume still has a contact header."
-_HARD_CONTACT = re.compile(
+_CONTACT = re.compile(
     r"[\w.+-]+@[\w-]+\.[\w.]+"                       # emails
     r"|(?:https?://|www\.)\S+"                       # urls
     r"|\b(?:github|linkedin)\.com/\S+"               # handles without scheme
-    r"|(?:\+?\d{1,3}[-. ]*)?\(?\d{3}\)?[-. ]*\d{3}[-. ]*\d{4}",  # phones
-    re.I)
-# the final embed-time scrub also drops the bullet glyph
-_CONTACT = re.compile(_HARD_CONTACT.pattern + r"|•", re.I)
-
-# Words a resume commonly OPENS with that are NOT a person's name. An already
-# stripped resume often starts on a heading or a summary line; without this we
-# could mistake it for the name and delete every instance of a real content
-# word.
-_NOT_A_NAME = {
-    "summary", "professional", "objective", "profile", "experience", "work",
-    "skills", "technical", "education", "projects", "project", "certifications",
-    "certification", "resume", "curriculum", "vitae", "contact", "about",
-    "qualifications", "employment", "history", "career", "highlights",
-}
-
-
-def _looks_like_name(line: str) -> bool:
-    """True only for a real name header: 1-4 capitalized, alphabetic tokens
-    (initials/hyphens/apostrophes ok) where none is a resume section word.
-    Rejects summary sentences, section headings and skill lines so they are
-    never deleted as if they were the candidate's name."""
-    toks = line.split()
-    if not 0 < len(toks) <= 4:
-        return False
-    for t in toks:
-        core = t.strip(".'").replace("-", "").replace("'", "")
-        if not core.isalpha() or not t[:1].isupper():
-            return False
-        if t.lower().strip(".") in _NOT_A_NAME:
-            return False
-    return True
+    r"|(?:\+?\d{1,3}[-. ]*)?\(?\d{3}\)?[-. ]*\d{3}[-. ]*\d{4}"  # phones
+    r"|•", re.I)
 
 
 def strip_contact(text: str) -> str:
-    """Resume minus name + contact boilerplate: EMBEDDING ONLY (the judge and
-    the <tag> resume builder still see the full text). Dropping the name and
-    contact details makes cosine match on skills/experience, not boilerplate.
-
-    Robust to an ALREADY-STRIPPED resume (one the user pre-trimmed to just
-    skills + experience -- see config/resume_stripped.example.txt): we only
-    pull a name off the top when the resume STILL has real contact details
-    (email / phone / url) AND that first line actually looks like a name. So a
-    stripped resume that opens on a heading or skill is never mistaken for a
-    name. Final backstop: a name-word is only removed where it occurs at most
-    twice -- a real name does; a recurring word is content, not a name."""
-    has_contact = _HARD_CONTACT.search(text) is not None
+    """Resume minus contact boilerplate: EMBEDDING ONLY (the judge and
+    the <tag> resume builder still see the full text). The first line is
+    taken as the candidate's NAME, and every instance of that name is
+    stripped. So company names elsewhere are never touched."""
     lines = text.splitlines()
     while lines and not lines[0].strip():            # docx exports often
         lines.pop(0)                                 # start with blank lines
     name = ""
-    if has_contact and lines and _looks_like_name(lines[0].strip()):
+    if lines and 0 < len(lines[0].split()) <= 5:     # 'John Doe' header line
         name = lines[0].strip()
         lines = lines[1:]
     body = "\n".join(lines)
     if name:
-        body = re.sub(re.escape(name), " ", body, flags=re.I)   # whole name
+        body = re.sub(re.escape(name), " ", body, flags=re.I)
         for w in name.split():                       # first/last name alone
-            core = w.strip(".'")
-            if len(core) < 3:
-                continue
-            pat = rf"(?i)(?<![a-z']){re.escape(core)}(?![a-z'])"
-            if len(re.findall(pat, body)) <= 2:      # recurring => content, keep
-                body = re.sub(pat, " ", body)
+            if len(w) >= 3:
+                body = re.sub(rf"(?i)(?<![a-z']){re.escape(w)}(?![a-z'])",
+                              " ", body)
     return _CONTACT.sub(" ", body)
 
 
@@ -131,20 +87,33 @@ def cosine(a: list[float], b: list[float]) -> float:
     return dot / (na * nb) if na and nb else 0.0
 
 
-PROMPT_V = "v4-embed-hash"  # bump when the judging method itself changes
+PROMPT_V = "v3-stripped-embed"  # bump when the judging method itself changes
+
+
+def embed_source(raw_resume: str) -> str:
+    """Text embedded for job-match similarity: a user-provided curated resume
+    (config/resume_embed.txt) when present, else the auto-stripped RESUME
+    (name + contact lines removed). Editing the curated file changes matches,
+    so it is folded into the rub below to force a re-score."""
+    if paths.RESUME_EMBED.exists():
+        return paths.RESUME_EMBED.read_text()
+    return strip_contact(raw_resume)
 
 
 def rubric_hash(vectors: dict, resume: str, judge: str,
-                wildcard: str = "", embed: str = "") -> str:
-    """Identifies WHAT scores were judged against (questions + anchors +
-    resume + judge model + prompt version + the stripped embed-resume).
-    Weights are excluded on purpose: they're applied at rank time, so
-    re-weighting never re-judges."""
+                wildcard: str = "", embed_custom: str = "") -> str:
+    """Identifies WHAT scores were judged/matched against (questions + anchors +
+    resume + judge model + prompt version, plus a CUSTOM embedding resume if
+    one is set). Weights are excluded on purpose: they're applied at rank time,
+    so re-weighting never re-judges. embed_custom is appended only when set, so
+    users on the default auto-strip keep their existing rub (no forced re-score)."""
     core = {n: {"q": (v or {}).get("question"), "a": (v or {}).get("anchors")}
             for n, v in vectors.items()}
     blob = (json.dumps(core, sort_keys=True, default=str)
             + "\0" + resume + "\0" + judge + "\0" + wildcard
-            + "\0" + embed + "\0" + PROMPT_V)
+            + "\0" + PROMPT_V)
+    if embed_custom:
+        blob += "\0EMBED\0" + embed_custom
     return hashlib.md5(blob.encode()).hexdigest()[:10]
 
 
@@ -153,17 +122,12 @@ def current_rub(cfg: dict, vectors: dict) -> str | None:
     score and rank so they can never drift apart."""
     if not paths.RESUME.exists():
         return None
-    # the cosine signal is computed against resume_embed.txt when it exists
-    # (see run() below). Fold it into the rub so editing the stripped match-
-    # resume re-scores too; without this, old cosine rows survive the same-rub
-    # gate and rankings silently mix two different embed texts. Absent file ->
-    # the embed source IS resume.txt, already captured by `resume` above.
-    embed = (paths.RESUME_EMBED.read_text()
-             if paths.RESUME_EMBED.exists() else "")
+    embed_custom = (clean_text(paths.RESUME_EMBED.read_text())
+                    if paths.RESUME_EMBED.exists() else "")
     return rubric_hash(vectors, clean_text(paths.RESUME.read_text()),
                        str(cfg["models"].get("judge", "")),
                        str(cfg["score"].get("wildcard") or "").strip(),
-                       embed=embed)
+                       embed_custom)
 
 
 def generate_json(host: str, model: str, prompt: str) -> dict:
@@ -265,7 +229,7 @@ def clamp01(v) -> float:
         return 0.0
 
 
-def run(cfg: dict, vectors: dict) -> int:
+def run(cfg: dict, vectors: dict, should_cancel=None) -> int:
     if not paths.JOBS.exists():
         print("no jobs scraped yet; run the full pipeline first "
               "(python3 start.py)", flush=True)
@@ -273,15 +237,11 @@ def run(cfg: dict, vectors: dict) -> int:
     host = ollama_host(cfg)
     raw_resume = paths.RESUME.read_text()
     resume = clean_text(raw_resume)
-    # cosine matches on skills/experience content only. If the user supplied a
-    # hand-stripped resume in the wizard (config/resume_embed.txt) embed THAT;
-    # otherwise auto-strip the name + contact header off resume.txt. The judge
-    # and the resume builder always use the full resume above, never this.
-    # strip_contact is a safe no-op on an already-stripped file.
-    embed_src = (paths.RESUME_EMBED.read_text()
-                 if paths.RESUME_EMBED.exists() else raw_resume)
+    # cosine is matched on skills/experience content only: a curated
+    # config/resume_embed.txt if the user provided one, else the auto-strip
+    # (name header + contact lines removed)
     resume_emb = embed(host, cfg["models"]["embed"],
-                       clean_text(strip_contact(embed_src)))
+                       clean_text(embed_source(raw_resume)))
 
     rub = current_rub(cfg, vectors)
     hours = int(cfg["scrape"].get("hours_old", 0) or 0)
@@ -318,6 +278,12 @@ def run(cfg: dict, vectors: dict) -> int:
     n = dupes = 0
     with paths.SCORES.open("a") as out:
         for job in todo:
+            # cooperative pause (Discord !pause): each job's score is written
+            # as it finishes, so the ones already done are safe on disk
+            if should_cancel and should_cancel():
+                print("  paused; jobs scored so far are saved "
+                      "(unscored ones retry next run)", flush=True)
+                break
             # the same posting on another board (or a same-day repost):
             # a fresh twin's score already represents it and rank
             # collapses them anyway, so judging this copy would only
@@ -384,9 +350,8 @@ def run(cfg: dict, vectors: dict) -> int:
             if key[1]:
                 done_keys.add(key)
             n += 1
-            parts = [f"exp={level}", f"cos={cos:.2f}"]
-            parts += [f"{k}={v:.2f}" for k, v in vscores.items()]
-            print(f"  [{n}/{len(todo)}] {final:.3f} ({', '.join(parts)}) "
+            vs = " ".join(f"{k}={v:.2f}" for k, v in vscores.items())
+            print(f"  [{n}/{len(todo)}] {final:.3f} ({level} cos {cos:.2f} {vs}) "
                   f"{title[:40]}", flush=True)
     if dupes:
         print(f"  {dupes} copies of already-scored postings skipped "

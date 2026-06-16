@@ -10,7 +10,7 @@ all interactively. This page is for people who prefer doing it by hand.
   `sudo apt install python3` (Linux). Then run `python3 start.py`.
   Windows gotcha: a bare "Python was not found" pointing at the Microsoft
   Store means `python3` is hitting the App-execution-alias stub, not a real
-  Python — install with the command above, then use `python start.py`.
+  Python; install with the command above, then use `python start.py`.
 - **Docker**: Windows: Docker Desktop → https://docs.docker.com/desktop/
   Linux: `sudo apt install docker.io docker-compose-v2`, then
   `sudo usermod -aG docker $USER` and log out/in.
@@ -45,7 +45,7 @@ sudo mkdir -p /etc/systemd/system/ollama.service.d
 printf '[Service]\nEnvironment="OLLAMA_HOST=0.0.0.0"\n' | sudo tee /etc/systemd/system/ollama.service.d/override.conf
 sudo systemctl daemon-reload && sudo systemctl restart ollama
 ```
-(Docker Desktop on Windows needs no change.)
+(Docker Desktop on Windows/Mac needs no change.)
 
 ## No Docker?
 
@@ -89,7 +89,7 @@ jobs that LIST pay below it. Postings without a date age from the day
 they were first scraped.
 
 Needs: your resume with a `<tag>` marker in the skills line (sample:
-`config/resume_template.example.docx`) and a free Discord bot's keys in
+`docs/resume_template.example.docx`) and a free Discord bot's keys in
 `.env`; the wizard steps through the developer portal one screen at a
 time, including the required MESSAGE CONTENT intent and DM settings.
 Start it:
@@ -99,7 +99,7 @@ docker compose --profile advanced run --rm bot
 ```
 
 Basic installs never see any of this: the bot has its own image stage
-(`discord.py` is in `requirements-advanced.txt` only) behind a compose
+(`discord.py` is installed only in that stage) behind a compose
 profile.
 
 ## Files
@@ -111,12 +111,9 @@ setup.py              interview-style setup wizard: writes profile.yaml,
 config/profile.yaml   THE user file: titles, location, level, salary floor,
                       exclusions + YOUR metrics (question + anchors + weight)
 config/config.yaml    system internals: weights, model names, scraper plumbing
-config/resume.txt     the resume jobs are matched against (and the judge reads)
-config/resume_embed.txt  OPTIONAL: a stripped resume used ONLY for matching
-                      (the wizard offers to create it; example:
-                      config/resume_stripped.example.txt)
+config/resume.txt     the resume jobs are matched against
 config/resume_template.txt  ADVANCED: resume with <tag> in the skills line
-config/resume_template.example.docx  sample resume showing the format
+docs/resume_template.example.docx  sample resume showing the format
 .env / .env.example   discord keys for advanced mode (compose env_file);
                       .env is gitignored; secrets never enter the image
 output/jobs.jsonl     raw scraped postings (append-only, deduped by seen.json)

@@ -53,37 +53,15 @@ class PipelineLock:
 
 ROOT = Path(__file__).resolve().parents[1]
 CONFIG_DIR = Path(os.environ.get("AUTOMATCH_CONFIG", ROOT / "config"))
-
-
-def _cfg_paths() -> dict:
-    """Optional `paths:` block in config.yaml, so output locations are settable
-    from config instead of only env vars. Best-effort: anything wrong (no yaml,
-    malformed file, no block) yields {} and we fall back to the defaults."""
-    try:
-        import yaml
-        data = yaml.safe_load((CONFIG_DIR / "config.yaml").read_text()) or {}
-        return {k: str(v) for k, v in (data.get("paths") or {}).items() if v}
-    except Exception:
-        return {}
-
-
-_PATHS = _cfg_paths()
-
-# Precedence for each location: env var > config.yaml `paths:` > default next
-# to the program. CONFIG_DIR can't be set in config.yaml (we'd have to read it
-# to find the file), so it stays env-or-default above.
-OUTPUT_DIR = Path(os.environ.get("AUTOMATCH_OUTPUT")
-                  or _PATHS.get("output_dir") or ROOT / "output")
+OUTPUT_DIR = Path(os.environ.get("AUTOMATCH_OUTPUT", ROOT / "output"))
 
 CONFIG = CONFIG_DIR / "config.yaml"
 PROFILE = CONFIG_DIR / "profile.yaml"
-# resume + stripped match-resume follow the same env > config.yaml > default
-# precedence as OUTPUT_DIR, so either can point at a file outside config/.
-RESUME = Path(os.environ.get("AUTOMATCH_RESUME")
-              or _PATHS.get("resume") or CONFIG_DIR / "resume.txt")
-RESUME_EMBED = Path(os.environ.get("AUTOMATCH_RESUME_EMBED")  # OPTIONAL: stripped
-                    or _PATHS.get("resume_embed")
-                    or CONFIG_DIR / "resume_embed.txt")
+VECTORS = CONFIG_DIR / "vectors.yaml"
+RESUME = CONFIG_DIR / "resume.txt"
+# OPTIONAL hand-curated resume used ONLY for embedding/match similarity; when
+# absent, score.py auto-strips RESUME (name + contact lines) instead.
+RESUME_EMBED = CONFIG_DIR / "resume_embed.txt"
 RESUME_TEMPLATE = CONFIG_DIR / "resume_template.txt"   # ADVANCED: has <tag>
 RESUME_TEMPLATE_DOCX = CONFIG_DIR / "resume_template.docx"  # original upload
 APPROVED = CONFIG_DIR / "approvedskills.txt"   # skills you confirmed having
