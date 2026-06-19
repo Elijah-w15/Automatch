@@ -112,11 +112,11 @@ list. Not using the bot? The same options live in the terminal: run `edit.py`
 from the `project_files` folder.
 
 Already have Python 3.10 or newer and just want to run it? `python project_files/start.py`
-(Windows) or `python3 project_files/start.py` (Linux). By-hand setup is in
-[project_files/docs/manual-setup.md](project_files/docs/manual-setup.md); sharper-results tips in
-[project_files/docs/tuning.md](project_files/docs/tuning.md); a map of every file in
-[project_files/docs/appendix.md](project_files/docs/appendix.md).
-
+  (Windows) or `python3 project_files/start.py` (Linux). By-hand setup is in
+  [project_files/docs/manual-setup.md](automatch/project_files/docs/manual-setup.md); sharper-results tips in
+  [project_files/docs/tuning.md](automatch/project_files/docs/tuning.md); a map of every file in
+  [project_files/docs/appendix.md](automatch/project_files/docs/appendix.md).
+  
 ---
 
 MIT licensed.
