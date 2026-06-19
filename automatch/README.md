@@ -1,4 +1,4 @@
-# automatch
+# Automatch
 
 A fully local job-matching tool. It scrapes job boards (via
 [JobSpy](https://github.com/Bunsly/JobSpy)), uses AI **on your own machine** to
