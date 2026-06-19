@@ -1,5 +1,0 @@
-# Base image runtime dependencies.
-python-jobspy
-pandas          # used directly in scrape.py, not pulled in transitively
-pyyaml
-requests
