@@ -119,4 +119,4 @@ Already have Python 3.10 or newer and just want to run it? `python project_files
   
 ---
 
-MIT licensed.
+MIT licensed
